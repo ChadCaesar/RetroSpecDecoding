@@ -1,0 +1,4 @@
+# ninja log v5
+0	13246	1782378322900747752	/home/lzg/zyt/SpeculativeDecoding/RetroSpecDecoding/library/retroinfer/build/temp.linux-x86_64-cpython-310/retroinfer_kernels/src/wave_buffer_cpu.o	85b59b9baa858ce0
+4	37060	1782378360330464879	/home/lzg/zyt/SpeculativeDecoding/RetroSpecDecoding/library/retroinfer/build/temp.linux-x86_64-cpython-310/retroinfer_kernels/src/gather_copy.o	2eaf8facc41204fe
+5	48319	1782378409006801232	/home/lzg/zyt/SpeculativeDecoding/RetroSpecDecoding/library/retroinfer/build/temp.linux-x86_64-cpython-310/retroinfer_kernels/src/batch_gemm_softmax.o	715dbe9e52057c0d

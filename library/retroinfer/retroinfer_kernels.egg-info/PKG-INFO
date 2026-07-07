@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: retroinfer_kernels
+Version: 0.1
+Summary: RetroInfer kernels and modules
+Requires-Python: >=3.10
+Requires-Dist: pybind11
+Requires-Dist: torch
+Dynamic: description
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+A collection of CUDA and C++ extensions for RetroInfer.
