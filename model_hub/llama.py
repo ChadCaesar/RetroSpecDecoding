@@ -88,6 +88,7 @@ class LlamaModel(LLM):
             self.device_map = 'cuda:0'
         
         if self.device_map != "auto":   # single GPU
+            torch.cuda.set_device(self.device_map)
             self.layer_mapping = {}
             for ldx in range(0, self.num_layers):
                 self.layer_mapping.update({str(ldx): self.device_map})
