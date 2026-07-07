@@ -1,4 +1,5 @@
 import math
+import time
 import torch
 from retroinfer_kernels import ThreadPool, WaveBufferCPU
 from retroinfer_kernels import gather_copy_and_concat, gather_copy_and_scatter, gather_copy_vectors, batch_gemm_softmax
@@ -332,6 +333,15 @@ class retroinfer_cache(KV_Cache):
                 self.mainevents[device_idx] = torch.cuda.Event()
                 self.copyevents[device_idx] = torch.cuda.Event()
         
+        # Timing accumulators for profiling sparse attention steps
+        self.enable_timing = True
+        self.timing_call_count = 0
+        self.timing_step1 = 0.0  # Top-K Cluster Search (Q@C + topk)
+        self.timing_step2 = 0.0  # Estimation Zone Attention
+        self.timing_step3 = 0.0  # WaveBuffer batch_access
+        self.timing_step4 = 0.0  # Execution Buffer Assembly (gather + concat)
+        self.timing_step5 = 0.0  # Retrieval + Steady Zone Attention
+
         # set decoding attention function
         self.attn_func = self.dense_attention
     
@@ -761,26 +771,33 @@ class retroinfer_cache(KV_Cache):
         """
         self.static_len_tensor.fill_(static_len)
 
-        # Softmax(QC^T) -> [batch_size*group_num, group_size, n_centroids]
+        # ---- Step 1: Top-K Cluster Search ----
+        torch.cuda.synchronize()
+        t0 = time.time()
         batch_gemm_softmax(queries, self.centroids[layer_idx], self.gemm_o, self.norm, self.sum, self.softmax_o,
                            self.batch_groups, self.group_size, self.n_centroids, self.head_dim, self.RSQRT_DIM, 0)
         torch.sum(self.softmax_o, dim=1, out=self.dist)  # Merge groups -> [batch_size*group_num, n_centroids]
         self.dist.masked_fill_(self.centroids_mask[layer_idx], self.DTYPE_MIN)  # mask empty clusters
         torch.topk(self.dist, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True, out=(self.cV, self.cI))
         self.cluster_ids.copy_(self.cI[..., :self.nprobe])  # copy the topk cluster ids to the CPU pin memory
+        torch.cuda.synchronize()
+        if self.enable_timing:
+            self.timing_step1 += time.time() - t0
 
-        # estimation zone attention computation
+        # ---- Step 2: Estimation Zone Attention ----
+        torch.cuda.synchronize()
+        t0 = time.time()
         if self.es_cluster_num > 0:
             gather_copy_vectors(
-                self.centroids[layer_idx], self.es_centroids, 
-                self.value_sum[layer_idx], self.es_value_sum, 
+                self.centroids[layer_idx], self.es_centroids,
+                self.value_sum[layer_idx], self.es_value_sum,
                 self.cluster_size[layer_idx], self.es_cluster_size,
-                self.cI, self.batch_groups, self.n_centroids, self.es_cluster_num, 
+                self.cI, self.batch_groups, self.n_centroids, self.es_cluster_num,
                 self.max_compute_cluster_num, self.nprobe, self.es_cluster_num
             )
-            
+
             es_out, es_lse = weighted_flash_decoding(
-                                queries.view(self.batch_groups, 1, self.group_size, self.head_dim), 
+                                queries.view(self.batch_groups, 1, self.group_size, self.head_dim),
                                 self.es_centroids,       # [batch_size*group_num, es_cluster_num, 1, dim]
                                 self.es_value_sum,       # [batch_size*group_num, es_cluster_num, 1, dim]
                                 self.es_cluster_size,    # [batch_size*group_num, 1, 1, es_cluster_num]
@@ -789,23 +806,38 @@ class retroinfer_cache(KV_Cache):
                             )
         else:
             es_out, es_lse = None, None
-        
-        # access cache and submit cache update jobs to thread pool
-        self.wave_buffer[layer_idx].batch_access()
+        torch.cuda.synchronize()
+        if self.enable_timing:
+            self.timing_step2 += time.time() - t0
 
-        # assemble the execution buffer
+        # ---- Step 3: WaveBuffer batch_access (CPU) ----
+        torch.cuda.synchronize()
+        t0 = time.time()
+        self.wave_buffer[layer_idx].batch_access()
+        torch.cuda.synchronize()
+        if self.enable_timing:
+            self.timing_step3 += time.time() - t0
+
+        # ---- Step 4: Execution Buffer Assembly ----
+        torch.cuda.synchronize()
+        t0 = time.time()
         gather_copy_and_concat(
-            self.steady_zone_keys[layer_idx], self.list_keys[layer_idx], self.cache_keys[layer_idx], self.execution_buffer_keys, 
+            self.steady_zone_keys[layer_idx], self.list_keys[layer_idx], self.cache_keys[layer_idx], self.execution_buffer_keys,
             self.steady_zone_values[layer_idx], self.list_values[layer_idx], self.cache_values[layer_idx], self.execution_buffer_values,
             self.miss_unit_idices[layer_idx], self.miss_unit_sizes[layer_idx], self.miss_unit_sizes_cumsum[layer_idx], self.miss_num_units[layer_idx],
             self.hit_unit_idices[layer_idx], self.hit_unit_sizes[layer_idx], self.hit_unit_sizes_cumsum[layer_idx], self.hit_num_units[layer_idx],
-            self.valid_lengths, self.batch_groups, self.static_stride, self.list_stride, self.cache_stride, self.execution_stride, 
+            self.valid_lengths, self.batch_groups, self.static_stride, self.list_stride, self.cache_stride, self.execution_stride,
             self.buffer_size, self.static_len_tensor
         )
+        torch.cuda.synchronize()
+        if self.enable_timing:
+            self.timing_step4 += time.time() - t0
 
-        # attention for retrieve zone and steady zone, merge the estimation zone results at the same time
+        # ---- Step 5: Retrieval + Steady Zone Attention ----
+        torch.cuda.synchronize()
+        t0 = time.time()
         attn_out = weighted_flash_decoding(
-            queries.view(self.batch_groups, 1, self.group_size, self.head_dim), 
+            queries.view(self.batch_groups, 1, self.group_size, self.head_dim),
             self.execution_buffer_keys,    # (batch_size*group_num, execution_stride, 1, dim)
             self.execution_buffer_values,  # (batch_size*group_num, execution_stride, 1, dim)
             previous_out=es_out,
@@ -813,20 +845,71 @@ class retroinfer_cache(KV_Cache):
             cache_seqlens=self.valid_lengths,  # valid lengths of retrieve zone + steady zone for each group
             return_softmax_lse=False
         )
+        torch.cuda.synchronize()
+        if self.enable_timing:
+            self.timing_step5 += time.time() - t0
 
-        # admit pages from execution buffer to GPU block cache
+        # ---- Step 6: Cache Admission (pipeline-hidden, not timed) ----
         self.wave_buffer[layer_idx].sync()  # wait for update LRU finish
         gather_copy_and_scatter(
-            self.execution_buffer_keys, self.cache_keys[layer_idx], 
+            self.execution_buffer_keys, self.cache_keys[layer_idx],
             self.execution_buffer_values, self.cache_values[layer_idx],
-            self.update_buffer_indices[layer_idx], self.update_unit_sizes[layer_idx], 
-            self.update_cache_indices[layer_idx], self.update_num_units[layer_idx], 
+            self.update_buffer_indices[layer_idx], self.update_unit_sizes[layer_idx],
+            self.update_cache_indices[layer_idx], self.update_num_units[layer_idx],
             self.batch_groups, self.execution_stride, self.cache_stride,
             self.buffer_size, self.static_len_tensor
         )
-        
+
+        if self.enable_timing:
+            self.timing_call_count += 1
+
         return attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim)
 
+    def report_timing(self):
+        """Print timing breakdown for the 5 profiled steps of sparse attention."""
+        if not self.enable_timing or self.timing_call_count == 0:
+            print("[Timing] No timing data collected. (CUDA graph mode or no decode steps)")
+            return
+
+        step1 = self.timing_step1
+        step2 = self.timing_step2
+        step3 = self.timing_step3
+        step4 = self.timing_step4
+        step5 = self.timing_step5
+        total = step1 + step2 + step3 + step4 + step5
+
+        # avoid division by zero
+        if total == 0:
+            print("[Timing] Total sparse attention time is 0, cannot compute breakdown.")
+            return
+
+        num_layers = self.layer_num
+        decode_tokens = max(1, self.timing_call_count // num_layers)
+
+        steps = [
+            ("Step1: Top-K Cluster Search     ", step1),
+            ("Step2: Estimation Zone Attn     ", step2),
+            ("Step3: WaveBuffer batch_access  ", step3),
+            ("Step4: Exec Buffer Assembly     ", step4),
+            ("Step5: Retrieval+Steady Attn    ", step5),
+        ]
+
+        print("\n" + "=" * 70)
+        print("  Sparse Attention Timing Breakdown")
+        print("=" * 70)
+        print(f"  Decode tokens        : {decode_tokens}")
+        print(f"  Layers per token     : {num_layers}")
+        print(f"  Total calls profiled : {self.timing_call_count}")
+        print(f"  Total sparse attn    : {total*1000:8.2f} ms")
+        print("-" * 70)
+        for label, t in steps:
+            pct = t / total * 100
+            ms_per_token = t * 1000 / decode_tokens
+            print(f"  {label}: {t*1000:8.2f} ms ({pct:5.1f}%)  [{ms_per_token:6.3f} ms/token]")
+        print("-" * 70)
+        ms_per_token_total = total * 1000 / decode_tokens
+        print(f"  Sparse attn per token: {ms_per_token_total:.3f} ms")
+        print("=" * 70 + "\n")
 
     def sparse_attention_with_cudagraph(self, queries, layer_idx, static_len):
         """

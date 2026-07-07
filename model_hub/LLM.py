@@ -210,6 +210,10 @@ class LLM:
             'green'
         ))
 
+        # Report sparse attention timing breakdown
+        if hasattr(self.kv_cache, 'report_timing'):
+            self.kv_cache.report_timing()
+
         print(colored(f"End2End Latency: {round((prefill_end - prefill_start + decode_end - decode_start), 4)} s\n", 'green'))
         
         outputs_ids = torch.cat(outputs_ids, dim=-1).tolist()
