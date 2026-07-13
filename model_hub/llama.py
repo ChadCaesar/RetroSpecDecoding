@@ -6,8 +6,8 @@ import torch.nn.functional as F
 import flashinfer
 from transformers import AutoTokenizer, LlamaForCausalLM, LlamaConfig
 from .LLM import LLM
-from cache_hub import flash_attn_cache, retroinfer_cache, retroinfer_cache_gpu
-from attn_hub import full_decode_attn, retroinfer_decode_attn, \
+from cache_hub import flash_attn_cache, retroinfer_cache, retroinfer_cache_gpu, specdecoder_cache
+from attn_hub import full_decode_attn, retroinfer_decode_attn, specdecoder_decode_attn, \
                      full_prefill_attn, prefill_xattn, prefill_minfer
 from .xattn_thresholds import llama_31_8b_8_thresholds, llama_3_8b_8_thresholds
 from .minfer_patterns import llama_31_8b_best_patterns, llama_3_8b_best_patterns
@@ -235,15 +235,46 @@ class LlamaModel(LLM):
                     num_gpus = self.num_gpus,
                     model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1))
                 )
+        elif self.attention_type == 'SpecDecoder':
+            specdecoder_config = llama_config.get(self.attention_type)
+
+            if specdecoder_config['gpu_only'] == False:   # Offload version
+                self.kv_cache = specdecoder_cache(
+                    valid_start = valid_start,
+                    layer_num = self.num_layers,
+                    batch_size = self.batch_size,
+                    max_length = self.max_new_length + self.input_length,
+                    num_key_value_heads = self.num_key_value_heads,
+                    num_heads = self.num_heads,
+                    head_dim = self.head_dim,
+                    dtype = self.dtype,
+                    layer_mapping = self.layer_mapping,
+                    max_new_length = self.max_new_length,
+                    static_pattern_start = specdecoder_config["static_pattern_start"],
+                    static_pattern_end = specdecoder_config["static_pattern_end"],
+                    core = specdecoder_config["core"],
+                    n_centroids = specdecoder_config["n_centroids"],
+                    n_segment = specdecoder_config["n_segment"],
+                    pages_per_cluster = specdecoder_config["pages_per_cluster"],
+                    retrieval_budget = specdecoder_config["retrieval_budget"],
+                    estimation_budget = specdecoder_config["estimation_budget"],
+                    cache_ratio = specdecoder_config["cache_ratio"],
+                    buffer_cluster_num = specdecoder_config["buffer_cluster_num"],
+                    use_cuda_graph = specdecoder_config["use_cuda_graph"],
+                    spec_stride = specdecoder_config["spec_stride"],
+                    prefill_bsz = self.prefill_bsz,
+                    num_gpus = self.num_gpus,
+                    model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)),
+                )
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
-
+    
     
     def move(self):
         torch.cuda.empty_cache()
         if self.attention_type == 'Full_Flash_Attn':
             self.kv_cache.move_gpu()
-        elif self.attention_type == 'RetroInfer':
+        elif self.attention_type in ['RetroInfer', 'SpecDecoder']:
             self.kv_cache.prepare_cache()
         torch.cuda.empty_cache()
 
@@ -284,7 +315,9 @@ class LlamaModel(LLM):
         if self.attention_type == 'Full_Flash_Attn':
             attn_out = full_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
         elif self.attention_type == 'RetroInfer':
-            attn_out = retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
+            attn_out = retroinfer_decode_attn(query_states, layer_idx, self.kv_cache)
+        elif self.attention_type == 'SpecDecoder':
+            attn_out = specdecoder_decode_attn(query_states, layer_idx, self.kv_cache)
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
         return attn_out
@@ -310,7 +343,7 @@ class LlamaModel(LLM):
             if hidden_states.shape[1] == 1:
                 self.kv_cache.batch_indices = self.kv_cache.batch_indices_dict[next_device]
                 self.kv_cache.valid_length = self.kv_cache.valid_length_dict[next_device]
-        elif self.attention_type == 'RetroInfer':
+        elif self.attention_type in ['RetroInfer', 'SpecDecoder']:
             if hidden_states.shape[1] == 1:
                 if isinstance(self.kv_cache, retroinfer_cache_gpu):
                     self.kv_cache.gemm_o = self.kv_cache.gemm_o_dict[next_device]

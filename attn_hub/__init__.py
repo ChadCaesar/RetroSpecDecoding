@@ -1,6 +1,7 @@
 
 from .full_attn import full_decode_attn, full_prefill_attn
 from .retroinfer_attn import retroinfer_decode_attn
+from .specdecoder_attn import specdecoder_decode_attn
 
 try:
     from .minfer import prefill_minfer

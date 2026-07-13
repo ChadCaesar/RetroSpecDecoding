@@ -1,6 +1,6 @@
 
 
-def retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, retroinfer_cache):
+def retroinfer_decode_attn(query_states, layer_idx, retroinfer_cache):
     """
     query_states: query vector, shape: (batch_size, 1, head_num, dim), gpu torch tensor
     """

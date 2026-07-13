@@ -191,18 +191,68 @@ class LLM:
         
         # Decoding
         print("Start decoding ...")
+        torch.cuda.synchronize()
         decode_start = time.time()
 
-        for _ in range(self.max_new_length-1):
-            logits = self.decode_forward(inputs_ids=output_ids)
-            output_ids = self.sampling(logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
-            if not ignore_eos:
-                end_of_text |= (output_ids == eos_token)
-                if end_of_text.all():
-                    print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
+        if self.attention_type in ['Full_Flash_Attn', 'RetroInfer']:
+            for _ in range(self.max_new_length-1):
+                logits = self.decode_forward(inputs_ids=output_ids)
+                output_ids = self.sampling(logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                if not ignore_eos:
+                    end_of_text |= (output_ids == eos_token)
+                    if end_of_text.all():
+                        print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
+                        break
+                outputs_ids.append(output_ids)
+        elif self.attention_type == "SpecDecoder":
+            generated_len = 0
+            draft_num = 0
+            verify_num = 0
+            reject_num = 0
+            step_num = 0
+            while generated_len < self.max_new_length-1:
+                # Draft 阶段
+                self.kv_cache.begin_draft()
+                draft_token = output_ids
+                draft_tokens = []
+                actual_stride = min(self.kv_cache.spec_stride, self.max_length-self.kv_cache.context-1)
+                for _ in range(actual_stride):
+                    draft_logits = self.decode_forward(inputs_ids=draft_token)
+                    draft_token = self.sampling(draft_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                    draft_tokens.append(draft_token)
+                    print(colored(f"{draft_token.item()}", 'blue'), end=" ")
+                    draft_num += 1
+                self.kv_cache.end_draft()
+                # Verify 阶段
+                verify_token = output_ids
+                verify_tokens = []
+                for draft_token in draft_tokens:
+                    verify_logits = self.decode_forward(inputs_ids=verify_token)
+                    verify_token = self.sampling(verify_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                    verify_tokens.append(verify_token)
+                    print(colored(f"{verify_token.item()}", 'red'), end=" ")
+                    verify_num += 1
+                    if verify_token != draft_token:
+                        reject_num += 1
+                        break
+                for verify_token in verify_tokens:
+                    outputs_ids.append(verify_token)
+                    generated_len += 1
+                    if not ignore_eos:
+                        end_of_text |= (verify_token == eos_token)
+                        if end_of_text.all():
+                            print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
+                            break
+                    if generated_len >= self.max_new_length-1:
+                        break
+                if not ignore_eos and end_of_text.all():
                     break
-            outputs_ids.append(output_ids)
+                output_ids = verify_tokens[-1]
+                step_num += 1
+                print()
+            print(colored(f"Draft tokens: {draft_num}, Verify tokens: {verify_num}, Generate steps: {step_num}, Accept rate: {round(100 * (verify_num - reject_num) / max(draft_num, 1), 2)} %, Accept tokens per step: {round((verify_num / max(step_num, 1)), 2)}", 'green'))
 
+        torch.cuda.synchronize()
         decode_end = time.time()
         print(colored(
             f"Decoding latency: {round((decode_end - decode_start), 4)} s ({round((decode_end - decode_start) * 1000 / (len(outputs_ids) - 1), 2)} ms/step), "
@@ -222,7 +272,7 @@ class LLM:
                  prefill_bsz=1, prefill_method="full"):
         """ LLM Inference.
         Args:
-            attention_type: str, Full_Flash_Attn or RetroInfer
+            attention_type: str, Full_Flash_Attn or RetroInfer or SpecDecoder.
             input_ids (torch.tensor): The input of LLM.
             attention_masks (torch.tensor): The attention masks of LLM.
             max_new_length (int): The maximum length of generated sequences.
