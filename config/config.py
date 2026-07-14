@@ -15,7 +15,7 @@ def add_config_args(parser):
 
 
 def add_spec_args(parser):
-    parser.add_argument("--spec_stride", type=int, default=3, help="Number of draft tokens per speculative step")
+    parser.add_argument("--spec_stride", type=int, default=10, help="Number of draft tokens per speculative step")
     return parser
 
 

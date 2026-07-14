@@ -254,6 +254,40 @@ public:
 
         return { hit_num, miss_num, hit_block_num, miss_block_num };
     }
+
+    inline std::tuple<int, int> batch_access_gpu_only(
+        const int64_t* keys, const int num,
+        int* hit_block_ids, int* hit_block_sizes, int* hit_block_sizes_cumsum
+    ) noexcept {
+        if (num == 0) return {0, 0};
+
+        int hit_num = 0, hit_block_num = 0, hit_cumsum = 0, consider_block_num = 0;
+
+        for (int i = 0; i < num; ++i) {
+            const int64_t& key = keys[i];
+            auto& cd = cluster_descriptors[key];
+            consider_block_num += cd.BlockNum;
+            if (consider_block_num > max_consider_block) break;
+
+            if (cd.inBlockCache) {
+                // === HIT: 记录 GPU block 信息 ===
+                hit_num++;
+                int* ids = cd.GPUBlockIDs;
+                std::copy(ids, ids + cd.BlockNum, hit_block_ids + hit_block_num);
+                for (int j = 0; j < cd.BlockNum - 1; ++j) {
+                    hit_block_sizes[hit_block_num]      = block_size;
+                    hit_block_sizes_cumsum[hit_block_num] = hit_cumsum;
+                    hit_cumsum += block_size;
+                    hit_block_num++;
+                }
+                hit_block_sizes[hit_block_num]      = cd.LastBlockSize;
+                hit_block_sizes_cumsum[hit_block_num] = hit_cumsum;
+                hit_cumsum += cd.LastBlockSize;
+                hit_block_num++;
+            }
+        }
+        return {hit_num, hit_block_num};
+    }
 };
 
 
@@ -736,6 +770,23 @@ public:
         }
     }
 
+    void batch_access_gpu_only(void* para) {
+        int thread_idx = reinterpret_cast<std::intptr_t>(para);
+        int _start = thread_idx * group_per_thread;
+        int _end = std::min((thread_idx + 1) * group_per_thread, batch_groups);
+
+        for (int i = _start; i < _end; ++i) {
+            auto [hit_num, hit_block_num] = caches[i]->batch_access_gpu_only(
+                searched_clusters_ptr + i * nprobe, nprobe,
+                hit_block_ids       + i * buffer_size,
+                hit_block_sizes     + i * buffer_size,
+                hit_block_sizes_cumsum + i * buffer_size
+            );
+            hit_block_nums[i]  = hit_block_num;
+            miss_block_nums[i] = 0;           // 无 CPU 数据
+        }
+    }
+
     void batch_update(void* para) {
         int thread_idx = reinterpret_cast<std::intptr_t>(para);
         int _start = thread_idx * group_per_thread;
@@ -789,6 +840,20 @@ public:
         return;
     }
 
+    void para_batch_access_gpu_only() {
+        pool_->LockQueue();
+        for (int i = 0; i < num_threads; ++i) {
+            pool_->QueueJobWOLock(
+                [this](void* para) { this->batch_access_gpu_only(para); },
+                reinterpret_cast<void*>(static_cast<std::intptr_t>(i)));
+        }
+        pool_->AddNumTask(num_threads);
+        pool_->UnlockQueue();
+        pool_->NotifyAll();
+        pool_->Wait();
+        // 注意：不提交 batch_update，不修改 cache 状态
+    }
+
     void sync() {
         pool_->Wait();
         return;
@@ -819,6 +884,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("update_kv", &WaveBufferCPU::update_kv, 
             py::arg("update_keys"), py::arg("update_values"), py::arg("clusters"), py::arg("cluster_size"), py::arg("searched_clusters"))
         .def("batch_access", &WaveBufferCPU::para_batch_access)
+        .def("batch_access_gpu_only", &WaveBufferCPU::para_batch_access_gpu_only)
         .def("sync", &WaveBufferCPU::sync);
     
     py::class_<MyThreadPool>(m, "MyThreadPool")

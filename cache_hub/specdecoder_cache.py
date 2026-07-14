@@ -757,6 +757,7 @@ class specdecoder_cache(KV_Cache):
         self.dist.masked_fill_(self.centroids_mask[layer_idx], self.DTYPE_MIN)  # mask empty clusters
         torch.topk(self.dist, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True, out=(self.cV, self.cI))
         self.draft_topk_indices[self.draft_step][layer_idx].copy_(self.cI)
+        self.cluster_ids.copy_(self.cI[..., :self.nprobe])
 
         if layer_idx == self.layer_num - 1:
             self.draft_step += 1
@@ -771,19 +772,32 @@ class specdecoder_cache(KV_Cache):
             0, self.es_cluster_num
         )
         es_out, es_lse = weighted_flash_decoding(
-                            queries.view(self.batch_groups, 1, self.group_size, self.head_dim), 
-                            self.es_centroids,       # [batch_size*group_num, es_cluster_num, 1, dim]
-                            self.es_value_sum,       # [batch_size*group_num, es_cluster_num, 1, dim]
-                            self.es_cluster_size,    # [batch_size*group_num, 1, 1, es_cluster_num]
-                            return_softmax_lse=True
-                        )
+            queries.view(self.batch_groups, 1, self.group_size, self.head_dim),
+            self.es_centroids, self.es_value_sum, self.es_cluster_size,
+            previous_out=None, previous_lse=None,
+            return_softmax_lse=True
+        )
+
+        self.wave_buffer[layer_idx].batch_access_gpu_only()
+
+        gather_copy_and_concat(
+            self.steady_zone_keys[layer_idx], self.list_keys[layer_idx],
+            self.cache_keys[layer_idx], self.execution_buffer_keys,
+            self.steady_zone_values[layer_idx], self.list_values[layer_idx],
+            self.cache_values[layer_idx], self.execution_buffer_values,
+            self.miss_unit_idices[layer_idx], self.miss_unit_sizes[layer_idx],
+            self.miss_unit_sizes_cumsum[layer_idx], self.miss_num_units[layer_idx],
+            self.hit_unit_idices[layer_idx], self.hit_unit_sizes[layer_idx],
+            self.hit_unit_sizes_cumsum[layer_idx], self.hit_num_units[layer_idx],
+            self.valid_lengths, self.batch_groups, self.static_stride,
+            self.list_stride, self.cache_stride, self.execution_stride,
+            self.buffer_size, self.static_len_tensor
+        )
         attn_out = weighted_flash_decoding(
             queries.view(self.batch_groups, 1, self.group_size, self.head_dim),
-            self.steady_zone_keys[layer_idx].view(self.batch_groups, -1, 1, self.head_dim),
-            self.steady_zone_values[layer_idx].view(self.batch_groups, -1, 1, self.head_dim),
-            previous_out=es_out,
-            previous_lse=es_lse,
-            cache_seqlens=static_len,
+            self.execution_buffer_keys, self.execution_buffer_values,
+            previous_out=es_out, previous_lse=es_lse,
+            cache_seqlens=self.valid_lengths,
             return_softmax_lse=False
         )
         

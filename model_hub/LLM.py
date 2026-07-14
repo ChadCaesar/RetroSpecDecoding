@@ -216,6 +216,8 @@ class LLM:
                 draft_token = output_ids
                 draft_tokens = []
                 actual_stride = min(self.kv_cache.spec_stride, self.max_length-self.kv_cache.context-1)
+                if actual_stride <= 0:
+                    break
                 for _ in range(actual_stride):
                     draft_logits = self.decode_forward(inputs_ids=draft_token)
                     draft_token = self.sampling(draft_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
