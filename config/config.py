@@ -4,7 +4,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 
 def add_config_args(parser):
-    parser.add_argument("--attn_type", type=str, default="RetroInfer",
+    parser.add_argument("--attn_type", type=str, default="SpecDecoder",
                         choices=["Full_Flash_Attn", "RetroInfer", "SpecDecoder"], help="Attention method")
     parser.add_argument("--retrieval_budget", type=float, default=0.018, help="Retrieval budget")
     parser.add_argument("--estimation_budget", type=float, default=0.232, help="Estimation budget for RetroInfer")
@@ -15,7 +15,7 @@ def add_config_args(parser):
 
 
 def add_spec_args(parser):
-    parser.add_argument("--spec_stride", type=int, default=3, help="Number of draft tokens per speculative step")
+    parser.add_argument("--spec_stride", type=int, default=9, help="Number of draft tokens per speculative step")
     return parser
 
 
