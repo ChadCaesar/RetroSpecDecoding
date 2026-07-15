@@ -99,7 +99,7 @@ class LLM:
         hidden_states = self.mlp(hidden_states, layer)
         hidden_states = residual + hidden_states
 
-        return hidden_states
+        return hidden_states, attn_out
 
 
     def prefill_forward(self, inputs_ids):
@@ -132,17 +132,17 @@ class LLM:
 
         if self.num_gpus > 1:
             for ldx in range(self.num_layers):
-                hidden_states = self.layer_decode(ldx, hidden_states)
+                hidden_states, attn_out = self.layer_decode(ldx, hidden_states)
                 hidden_states = self.parameter_move(hidden_states, ldx)
             hidden_states = hidden_states.to(self.layers[0].device)
         else:
             for ldx in range(self.num_layers):
-                hidden_states = self.layer_decode(ldx, hidden_states)
+                hidden_states, attn_out = self.layer_decode(ldx, hidden_states)
         
         hidden_states = self.layernorm(hidden_states, self.norm_variance_epsilon, self.norm_weight)
         logits = self.lm(hidden_states)
         
-        return logits
+        return logits, attn_out
 
 
     def sampling(self, logits, do_sample=False, temperature=0.6, top_p=0.95, top_k=20):
@@ -196,7 +196,7 @@ class LLM:
 
         if self.attention_type in ['Full_Flash_Attn', 'RetroInfer']:
             for _ in range(self.max_new_length-1):
-                logits = self.decode_forward(inputs_ids=output_ids)
+                logits, attn_out = self.decode_forward(inputs_ids=output_ids)
                 output_ids = self.sampling(logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                 if not ignore_eos:
                     end_of_text |= (output_ids == eos_token)
@@ -214,12 +214,14 @@ class LLM:
                 # Draft 阶段
                 self.kv_cache.begin_draft()
                 draft_token = output_ids
+                draft_attn_outs = []
                 draft_tokens = []
                 actual_stride = min(self.kv_cache.spec_stride, self.max_length-self.kv_cache.context-1)
                 if actual_stride <= 0:
                     break
                 for _ in range(actual_stride):
-                    draft_logits = self.decode_forward(inputs_ids=draft_token)
+                    draft_logits, draft_attn_out = self.decode_forward(inputs_ids=draft_token)
+                    draft_attn_outs.append(draft_attn_out)
                     draft_token = self.sampling(draft_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                     draft_tokens.append(draft_token)
                     print(colored(f"{draft_token.item()}", 'blue'), end=" ")
@@ -228,15 +230,19 @@ class LLM:
                 # Verify 阶段
                 verify_token = output_ids
                 verify_tokens = []
-                for draft_token in draft_tokens:
-                    verify_logits = self.decode_forward(inputs_ids=verify_token)
+                for i in range(actual_stride):
+                    verify_logits, verify_attn_out = self.decode_forward(inputs_ids=verify_token)
                     verify_token = self.sampling(verify_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                     verify_tokens.append(verify_token)
-                    print(colored(f"{verify_token.item()}", 'red'), end=" ")
                     verify_num += 1
-                    if verify_token != draft_token:
+                    print(colored(f"{verify_token.item()}", 'yellow'), end="")
+                    draft_attn_out = draft_attn_outs[i]
+                    sim = torch.cosine_similarity(draft_attn_out, verify_attn_out, dim=-1)
+                    if verify_token != draft_tokens[i]:
                         reject_num += 1
+                        print(colored(f"({round(sim.mean().item(), 4)}, {round(sim.max().item(), 4)}, {round(sim.min().item(), 4)})", 'red'), end=" ")
                         break
+                    print(colored(f"({round(sim.mean().item(), 4)}, {round(sim.max().item(), 4)}, {round(sim.min().item(), 4)})", 'green'), end=" ")
                 for verify_token in verify_tokens:
                     outputs_ids.append(verify_token)
                     generated_len += 1
