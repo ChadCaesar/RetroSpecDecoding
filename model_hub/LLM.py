@@ -161,6 +161,62 @@ class LLM:
         return output_ids
 
 
+    def compute_stability_ratio(self, draft_logits, verify_logits):
+        # Draft/Verify logits，形状由 [batch, 1, vocab] 转为 [batch, vocab]
+        draft_logits_fp32 = draft_logits.float().squeeze(1)
+        verify_logits_fp32 = verify_logits.detach().float().squeeze(1)
+
+        # Verify top-1/top-2 margin
+        verify_top2 = torch.topk(verify_logits_fp32, k=2, dim=-1)
+        verify_top1_id = verify_top2.indices[:, 0:1]
+        verify_margin = (verify_top2.values[:, 0] - verify_top2.values[:, 1])
+
+        # 计算 Draft 相对于 Verify 决策边界的最大扰动
+        draft_value_at_verify_top1 = draft_logits_fp32.gather(dim=-1, index=verify_top1_id)
+        verify_top1_value = verify_logits_fp32.gather(dim=-1, index=verify_top1_id)
+
+        draft_gaps = draft_value_at_verify_top1 - draft_logits_fp32
+        verify_gaps = verify_top1_value - verify_logits_fp32
+
+        gap_linf = (draft_gaps - verify_gaps).abs().amax(dim=-1)
+
+        stability_ratio = (gap_linf / verify_margin.clamp_min(1e-12))
+        return gap_linf, verify_margin, stability_ratio
+
+
+    def print_metric_summary(self, group_name, records):
+        if len(records) == 0:
+            print(f"\n{group_name}: no samples")
+            return
+
+        metric_names = ["attention_mean", "gap_linf", "verify_margin", "stability_ratio"]
+
+        print(f"\n{group_name}: count={len(records)}")
+
+        for metric_name in metric_names:
+            values = torch.tensor([record[metric_name] for record in records], dtype=torch.float64)
+            quantiles = torch.quantile(values, torch.tensor([0.25, 0.50, 0.75], dtype=values.dtype))
+            q25, median, q75 = quantiles.tolist()
+
+            print(
+                f"  {metric_name}: "
+                f"mean={values.mean().item():.4f}, "
+                f"median={median:.4f}, "
+                f"q25={q25:.4f}, "
+                f"q75={q75:.4f}, "
+                f"min={values.min().item():.4f}, "
+                f"max={values.max().item():.4f}"
+            )
+
+        ratio_values = torch.tensor([record["stability_ratio"] for record in records], dtype=torch.float64)
+        ratio_below_one = (ratio_values < 1.0).double().mean().item() * 100.0
+
+        print(
+            f"  stability_ratio < 1: "
+            f"{ratio_below_one:.2f}%"
+        )
+
+
     def inference(self, inputs_ids, do_sample=False, temperature=0.6, top_p=0.95, top_k=20, ignore_eos=True):
         outputs_ids = []    # multi iteration, multi request
         output_ids = []     # single iteration, multi request
@@ -210,9 +266,12 @@ class LLM:
             verify_num = 0
             reject_num = 0
             step_num = 0
+            accepted_metrics = []
+            rejected_metrics = []
             while generated_len < self.max_new_length-1:
                 # Draft 阶段
                 self.kv_cache.begin_draft()
+                draft_logits_list = []
                 draft_token = output_ids
                 draft_attn_outs = []
                 draft_tokens = []
@@ -221,6 +280,7 @@ class LLM:
                     break
                 for _ in range(actual_stride):
                     draft_logits, draft_attn_out = self.decode_forward(inputs_ids=draft_token)
+                    draft_logits_list.append(draft_logits)
                     draft_attn_outs.append(draft_attn_out)
                     draft_token = self.sampling(draft_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                     draft_tokens.append(draft_token)
@@ -233,16 +293,29 @@ class LLM:
                 for i in range(actual_stride):
                     verify_logits, verify_attn_out = self.decode_forward(inputs_ids=verify_token)
                     verify_token = self.sampling(verify_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
-                    verify_tokens.append(verify_token)
-                    verify_num += 1
                     print(colored(f"{verify_token.item()}", 'yellow'), end="")
+                    draft_logits = draft_logits_list[i]
                     draft_attn_out = draft_attn_outs[i]
-                    sim = torch.cosine_similarity(draft_attn_out, verify_attn_out, dim=-1)
-                    if verify_token != draft_tokens[i]:
+                    attn_sim = torch.cosine_similarity(draft_attn_out.float(), verify_attn_out.float(), dim=-1)
+                    gap_linf, verify_margin, stability_ratio = self.compute_stability_ratio(draft_logits, verify_logits)
+                    metric_record = {
+                        "attention_mean": attn_sim.mean().item(),
+                        "gap_linf": gap_linf.mean().item(),
+                        "verify_margin": verify_margin.mean().item(),
+                        "stability_ratio": stability_ratio.mean().item(),
+                    }
+                    accept = torch.equal(verify_token, draft_tokens[i])
+                    if accept:
+                        accepted_metrics.append(metric_record)
+                    else:
+                        rejected_metrics.append(metric_record)
+
+                    print(colored(f"({round(attn_sim.mean().item(), 4)}, {round(gap_linf.mean().item(), 4)}, {round(verify_margin.mean().item(), 4)}, {round(stability_ratio.mean().item(), 4)})", 'green' if accept else 'red'), end=" ")
+                    verify_tokens.append(verify_token)
+                    if not accept:
                         reject_num += 1
-                        print(colored(f"({round(sim.mean().item(), 4)}, {round(sim.max().item(), 4)}, {round(sim.min().item(), 4)})", 'red'), end=" ")
                         break
-                    print(colored(f"({round(sim.mean().item(), 4)}, {round(sim.max().item(), 4)}, {round(sim.min().item(), 4)})", 'green'), end=" ")
+                    verify_num += 1
                 for verify_token in verify_tokens:
                     outputs_ids.append(verify_token)
                     generated_len += 1
@@ -258,7 +331,9 @@ class LLM:
                 output_ids = verify_tokens[-1]
                 step_num += 1
                 print()
-            print(colored(f"Draft tokens: {draft_num}, Verify tokens: {verify_num}, Generate steps: {step_num}, Accept rate: {round(100 * (verify_num - reject_num) / max(draft_num, 1), 2)} %, Accept tokens per step: {round((verify_num / max(step_num, 1)), 2)}", 'green'))
+            print(colored(f"Draft tokens: {draft_num}, Verify tokens: {verify_num}, Generate steps: {step_num}, Accept rate: {round(100 * verify_num / max(verify_num + reject_num, 1), 2)} %, Accept tokens per step: {round((verify_num / max(step_num, 1)), 2)}", 'green'))
+            self.print_metric_summary("Accepted group", accepted_metrics)
+            self.print_metric_summary("Rejected group", rejected_metrics)
 
         torch.cuda.synchronize()
         decode_end = time.time()
