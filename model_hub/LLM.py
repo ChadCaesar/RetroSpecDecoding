@@ -47,6 +47,9 @@ class LLM:
         key_states = key_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
+        if self.attention_type == "SpecDecoder":
+            self.verify_kv_cache.prefill_update_kv_cache(query_states, key_states, value_states, layer_idx, start_bdx)
+            self.verify_kv_cache.sync(layer_idx, start_bdx)
         key_states, value_states = self.kv_cache.prefill_update_kv_cache(query_states, key_states, value_states, layer_idx, start_bdx)
         temp_attn_out = self.prefill_attention(query_states, key_states, value_states, layer_idx)
         self.kv_cache.sync(layer_idx, start_bdx)
@@ -72,8 +75,9 @@ class LLM:
         return hidden_states
 
 
-    def layer_decode(self, layer_idx, hidden_states):
+    def layer_decode(self, layer_idx, hidden_states, decode_mode=None):
         # print(f'Layer = {layer_idx}')
+        verify_full = self.attention_type == "SpecDecoder" and decode_mode == "verify_full"
 
         residual = hidden_states
         bsz, seq_len, dim = hidden_states.shape
@@ -83,14 +87,18 @@ class LLM:
         hidden_states = self.layernorm(hidden_states, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
         
         query_states, key_states, value_states = self.wqkv(hidden_states, layer)
-        query_states, key_states = self.position_embedd(query_states, key_states)
+        query_states, key_states = self.position_embedd(query_states, key_states) if not verify_full else self.position_embedd(query_states, key_states, kv_cache=self.verify_kv_cache)
 
         query_states = query_states.view(bsz, seq_len, self.num_heads, self.head_dim)
         key_states = key_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
-        key_states, value_states = self.kv_cache.decode_update_kv_cache(key_states, value_states, layer_idx)
-        attn_out = self.decode_attention(query_states, key_states, value_states, layer_idx)
+        if verify_full:
+            self.kv_cache.decode_update_kv_cache(key_states, value_states, layer_idx)
+            key_states, value_states = self.verify_kv_cache.decode_update_kv_cache(key_states, value_states, layer_idx)
+        else:
+            key_states, value_states = self.kv_cache.decode_update_kv_cache(key_states, value_states, layer_idx)
+        attn_out = self.decode_attention(query_states, key_states, value_states, layer_idx, decode_mode=decode_mode)
         hidden_states = self.wo(attn_out, layer, bsz, seq_len, dim)
         hidden_states = residual + hidden_states
 
@@ -127,17 +135,17 @@ class LLM:
         return logits
         
 
-    def decode_forward(self, inputs_ids):
+    def decode_forward(self, inputs_ids, decode_mode=None):
         hidden_states = self.word_embedding(inputs_ids)
 
         if self.num_gpus > 1:
             for ldx in range(self.num_layers):
-                hidden_states, attn_out = self.layer_decode(ldx, hidden_states)
+                hidden_states, attn_out = self.layer_decode(ldx, hidden_states, decode_mode=decode_mode)
                 hidden_states = self.parameter_move(hidden_states, ldx)
             hidden_states = hidden_states.to(self.layers[0].device)
         else:
             for ldx in range(self.num_layers):
-                hidden_states, attn_out = self.layer_decode(ldx, hidden_states)
+                hidden_states, attn_out = self.layer_decode(ldx, hidden_states, decode_mode=decode_mode)
         
         hidden_states = self.layernorm(hidden_states, self.norm_variance_epsilon, self.norm_weight)
         logits = self.lm(hidden_states)
@@ -279,7 +287,7 @@ class LLM:
                 if actual_stride <= 0:
                     break
                 for _ in range(actual_stride):
-                    draft_logits, draft_attn_out = self.decode_forward(inputs_ids=draft_token)
+                    draft_logits, draft_attn_out = self.decode_forward(inputs_ids=draft_token, decode_mode="draft")
                     draft_logits_list.append(draft_logits)
                     draft_attn_outs.append(draft_attn_out)
                     draft_token = self.sampling(draft_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
@@ -291,7 +299,7 @@ class LLM:
                 verify_token = output_ids
                 verify_tokens = []
                 for i in range(actual_stride):
-                    verify_logits, verify_attn_out = self.decode_forward(inputs_ids=verify_token)
+                    verify_logits, verify_attn_out = self.decode_forward(inputs_ids=verify_token, decode_mode="verify_full")
                     verify_token = self.sampling(verify_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                     print(colored(f"{verify_token.item()}", 'yellow'), end="")
                     draft_logits = draft_logits_list[i]

@@ -160,6 +160,7 @@ class LlamaModel(LLM):
     def init_kv_cache(self, valid_start, attn_config):
         # collect memory from previous kv_cache
         self.kv_cache = None
+        self.verify_kv_cache = None
         gc.collect()
 
         llama_config = attn_config
@@ -266,6 +267,20 @@ class LlamaModel(LLM):
                     num_gpus = self.num_gpus,
                     model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)),
                 )
+                self.verify_kv_cache = flash_attn_cache(
+                    valid_start = valid_start,
+                    layer_num = self.num_layers,
+                    batch_size = self.batch_size,
+                    max_length = self.max_new_length + self.input_length,
+                    num_key_value_heads = self.num_key_value_heads,
+                    num_heads = self.num_heads,
+                    head_dim = self.head_dim,
+                    dtype = self.dtype,
+                    layer_mapping = self.layer_mapping,
+                    prefill_bsz = self.prefill_bsz,
+                    num_gpus = self.num_gpus,
+                    model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)),
+                )
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
     
@@ -274,8 +289,11 @@ class LlamaModel(LLM):
         torch.cuda.empty_cache()
         if self.attention_type == 'Full_Flash_Attn':
             self.kv_cache.move_gpu()
-        elif self.attention_type in ['RetroInfer', 'SpecDecoder']:
+        elif self.attention_type == 'RetroInfer':
             self.kv_cache.prepare_cache()
+        elif self.attention_type == 'SpecDecoder':
+            self.kv_cache.prepare_cache()
+            self.verify_kv_cache.move_gpu()
         torch.cuda.empty_cache()
 
     
@@ -311,13 +329,17 @@ class LlamaModel(LLM):
         return attn_out
     
 
-    def decode_attention(self, query_states, key_states, value_states, layer_idx):
+    def decode_attention(self, query_states, key_states, value_states, layer_idx, decode_mode=None):
         if self.attention_type == 'Full_Flash_Attn':
             attn_out = full_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
         elif self.attention_type == 'RetroInfer':
             attn_out = retroinfer_decode_attn(query_states, layer_idx, self.kv_cache)
         elif self.attention_type == 'SpecDecoder':
-            attn_out = specdecoder_decode_attn(query_states, layer_idx, self.kv_cache)
+            if decode_mode == "verify_full":
+                specdecoder_decode_attn(query_states, layer_idx, self.kv_cache)
+                attn_out = full_decode_attn(query_states, key_states, value_states, layer_idx, self.verify_kv_cache)
+            else:
+                attn_out = specdecoder_decode_attn(query_states, layer_idx, self.kv_cache)
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
         return attn_out
@@ -343,7 +365,7 @@ class LlamaModel(LLM):
             if hidden_states.shape[1] == 1:
                 self.kv_cache.batch_indices = self.kv_cache.batch_indices_dict[next_device]
                 self.kv_cache.valid_length = self.kv_cache.valid_length_dict[next_device]
-        elif self.attention_type in ['RetroInfer', 'SpecDecoder']:
+        elif self.attention_type == 'RetroInfer':
             if hidden_states.shape[1] == 1:
                 if isinstance(self.kv_cache, retroinfer_cache_gpu):
                     self.kv_cache.gemm_o = self.kv_cache.gemm_o_dict[next_device]
@@ -377,16 +399,33 @@ class LlamaModel(LLM):
                         self.kv_cache.es_centroids = self.kv_cache.es_centroids_dict[next_device]
                         self.kv_cache.es_value_sum = self.kv_cache.es_value_sum_dict[next_device]
                         self.kv_cache.es_cluster_size = self.kv_cache.es_cluster_size_dict[next_device]
-                        if self.attention_type == 'SpecDecoder':
-                            self.kv_cache.draft_estimate_mask = self.kv_cache.draft_estimate_mask_dict[next_device]
-                            self.kv_cache.draft_miss_cluster_ids = self.kv_cache.draft_miss_cluster_ids_dict[next_device]
-                            self.kv_cache.draft_miss_counts = self.kv_cache.draft_miss_counts_dict[next_device]
-                            self.kv_cache.miss_centroids = self.kv_cache.miss_centroids_dict[next_device]
-                            self.kv_cache.miss_value_sum = self.kv_cache.miss_value_sum_dict[next_device]
-                            self.kv_cache.miss_cluster_size = self.kv_cache.miss_cluster_size_dict[next_device]
                         self.kv_cache.execution_buffer_keys = self.kv_cache.execution_buffer_keys_dict[next_device]
                         self.kv_cache.execution_buffer_values = self.kv_cache.execution_buffer_values_dict[next_device]
                         self.kv_cache.valid_lengths = self.kv_cache.valid_lengths_dict[next_device]
+        elif self.attention_type == 'SpecDecoder':
+            if hidden_states.shape[1] == 1:
+                self.kv_cache.cI = self.kv_cache.cI_dict[next_device]
+                self.kv_cache.static_len_tensor = self.kv_cache.static_len_tensor_dict[next_device]
+                self.kv_cache.gemm_o = self.kv_cache.gemm_o_dict[next_device]
+                self.kv_cache.softmax_o = self.kv_cache.softmax_o_dict[next_device]
+                self.kv_cache.norm = self.kv_cache.norm_dict[next_device]
+                self.kv_cache.sum = self.kv_cache.sum_dict[next_device]
+                self.kv_cache.dist = self.kv_cache.dist_dict[next_device]
+                self.kv_cache.cV = self.kv_cache.cV_dict[next_device]
+                self.kv_cache.es_centroids = self.kv_cache.es_centroids_dict[next_device]
+                self.kv_cache.es_value_sum = self.kv_cache.es_value_sum_dict[next_device]
+                self.kv_cache.es_cluster_size = self.kv_cache.es_cluster_size_dict[next_device]
+                self.kv_cache.draft_estimate_mask = self.kv_cache.draft_estimate_mask_dict[next_device]
+                self.kv_cache.draft_miss_cluster_ids = self.kv_cache.draft_miss_cluster_ids_dict[next_device]
+                self.kv_cache.draft_miss_counts = self.kv_cache.draft_miss_counts_dict[next_device]
+                self.kv_cache.miss_centroids = self.kv_cache.miss_centroids_dict[next_device]
+                self.kv_cache.miss_value_sum = self.kv_cache.miss_value_sum_dict[next_device]
+                self.kv_cache.miss_cluster_size = self.kv_cache.miss_cluster_size_dict[next_device]
+                self.verify_kv_cache.batch_indices = self.verify_kv_cache.batch_indices_dict[next_device]
+                self.verify_kv_cache.valid_length = self.verify_kv_cache.valid_length_dict[next_device]
+                self.kv_cache.execution_buffer_keys = self.kv_cache.execution_buffer_keys_dict[next_device]
+                self.kv_cache.execution_buffer_values = self.kv_cache.execution_buffer_values_dict[next_device]
+                self.kv_cache.valid_lengths = self.kv_cache.valid_lengths_dict[next_device]
         return hidden_states
 
     
@@ -409,8 +448,10 @@ class LlamaModel(LLM):
         return query_states, key_states
 
 
-    def position_embedd(self, query_states, key_states):
+    def position_embedd(self, query_states, key_states, kv_cache=None):
+        if kv_cache is None:
+            kv_cache = self.kv_cache
         bsz, seq_len, _ = key_states.shape
-        position_ids = self.position_ids[self.kv_cache.context:self.kv_cache.context+seq_len].unsqueeze(0).repeat(bsz, 1)
+        position_ids = self.position_ids[kv_cache.context:kv_cache.context+seq_len].unsqueeze(0).repeat(bsz, 1)
         query_states, key_states = self.apply_rotary_pos_emb(query_states, key_states, position_ids)
         return query_states, key_states
