@@ -377,6 +377,13 @@ class LlamaModel(LLM):
                         self.kv_cache.es_centroids = self.kv_cache.es_centroids_dict[next_device]
                         self.kv_cache.es_value_sum = self.kv_cache.es_value_sum_dict[next_device]
                         self.kv_cache.es_cluster_size = self.kv_cache.es_cluster_size_dict[next_device]
+                        if self.attention_type == 'SpecDecoder':
+                            self.kv_cache.draft_estimate_mask = self.kv_cache.draft_estimate_mask_dict[next_device]
+                            self.kv_cache.draft_miss_cluster_ids = self.kv_cache.draft_miss_cluster_ids_dict[next_device]
+                            self.kv_cache.draft_miss_counts = self.kv_cache.draft_miss_counts_dict[next_device]
+                            self.kv_cache.miss_centroids = self.kv_cache.miss_centroids_dict[next_device]
+                            self.kv_cache.miss_value_sum = self.kv_cache.miss_value_sum_dict[next_device]
+                            self.kv_cache.miss_cluster_size = self.kv_cache.miss_cluster_size_dict[next_device]
                         self.kv_cache.execution_buffer_keys = self.kv_cache.execution_buffer_keys_dict[next_device]
                         self.kv_cache.execution_buffer_values = self.kv_cache.execution_buffer_values_dict[next_device]
                         self.kv_cache.valid_lengths = self.kv_cache.valid_lengths_dict[next_device]

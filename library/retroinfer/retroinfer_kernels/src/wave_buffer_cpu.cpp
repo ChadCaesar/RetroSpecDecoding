@@ -257,11 +257,13 @@ public:
 
     inline std::tuple<int, int> batch_access_gpu_only(
         const int64_t* keys, const int num,
-        int* hit_block_ids, int* hit_block_sizes, int* hit_block_sizes_cumsum
+        int* hit_block_ids, int* hit_block_sizes, int* hit_block_sizes_cumsum,
+        int* estimate_mask
     ) noexcept {
         if (num == 0) return {0, 0};
 
         int hit_num = 0, hit_block_num = 0, hit_cumsum = 0, consider_block_num = 0;
+        std::fill(estimate_mask, estimate_mask + num, 1);
 
         for (int i = 0; i < num; ++i) {
             const int64_t& key = keys[i];
@@ -272,6 +274,7 @@ public:
             if (cd.inBlockCache) {
                 // === HIT: 记录 GPU block 信息 ===
                 hit_num++;
+                estimate_mask[i] = 0;
                 int* ids = cd.GPUBlockIDs;
                 std::copy(ids, ids + cd.BlockNum, hit_block_ids + hit_block_num);
                 for (int j = 0; j < cd.BlockNum - 1; ++j) {
@@ -346,6 +349,9 @@ public:
     int* miss_block_sizes;          // valid vector number of each missing blocks
     int* miss_block_sizes_cumsum;   // cumsum of miss_block_sizes
     int* miss_block_nums;           // number of missing block ids for each group
+
+    int* estimate_mask_ptr;
+    int estimate_mask_stride;
         
     int* update_buffer_indices;     // buffer start vector position of each update blocks
     int* update_block_sizes;        // valid vector number of each update blocks
@@ -387,6 +393,9 @@ public:
         miss_block_sizes = nullptr;
         miss_block_sizes_cumsum = nullptr;
         miss_block_nums = nullptr;
+
+        estimate_mask_ptr = nullptr;
+        estimate_mask_stride = 0;
 
         update_buffer_indices = nullptr;
         update_block_sizes = nullptr;
@@ -462,6 +471,8 @@ public:
         miss_block_sizes_cumsum = nullptr;
         miss_block_nums = nullptr;
 
+        estimate_mask_ptr = nullptr;
+
         update_buffer_indices = nullptr;
         update_block_sizes = nullptr;
         update_cache_indices = nullptr;
@@ -478,6 +489,8 @@ public:
         torch::Tensor& miss_block_sizes_tensor,
         torch::Tensor& miss_block_sizes_cumsum_tensor,
         torch::Tensor& miss_block_nums_tensor,
+
+        torch::Tensor& estimate_mask,
 
         torch::Tensor& update_buffer_indices_tensor,
         torch::Tensor& update_block_sizes_tensor,
@@ -501,6 +514,9 @@ public:
         // AT_ASSERT(miss_block_ids_tensor.size(-1) == buffer_size, "Wrong miss block ids size.");
         // AT_ASSERT(miss_block_sizes_tensor.size(-1) == buffer_size, "Wrong miss block sizes size.");
         // AT_ASSERT(miss_block_sizes_cumsum_tensor.size(-1) == buffer_size, "Wrong miss block sizes cumsum size.");
+
+        estimate_mask_ptr = static_cast<int*>(estimate_mask.data_ptr<int32_t>());
+        estimate_mask_stride = estimate_mask.size(1);
 
         update_buffer_indices = static_cast<int*>(update_buffer_indices_tensor.data_ptr<int32_t>());
         update_block_sizes = static_cast<int*>(update_block_sizes_tensor.data_ptr<int32_t>()); 
@@ -778,9 +794,10 @@ public:
         for (int i = _start; i < _end; ++i) {
             auto [hit_num, hit_block_num] = caches[i]->batch_access_gpu_only(
                 searched_clusters_ptr + i * nprobe, nprobe,
-                hit_block_ids       + i * buffer_size,
-                hit_block_sizes     + i * buffer_size,
-                hit_block_sizes_cumsum + i * buffer_size
+                hit_block_ids + i * buffer_size,
+                hit_block_sizes + i * buffer_size,
+                hit_block_sizes_cumsum + i * buffer_size,
+                estimate_mask_ptr + i * estimate_mask_stride
             );
             hit_block_nums[i]  = hit_block_num;
             miss_block_nums[i] = 0;           // 无 CPU 数据
@@ -874,6 +891,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("set_indices", &WaveBufferCPU::set_indices, 
             py::arg("hit_block_ids"), py::arg("hit_block_sizes"), py::arg("hit_block_sizes_cumsum"), py::arg("hit_block_nums"),
             py::arg("miss_block_ids"), py::arg("miss_block_sizes"), py::arg("miss_block_sizes_cumsum"), py::arg("miss_block_nums"),
+            py::arg("estimate_mask"),
             py::arg("update_buffer_indices"), py::arg("update_block_sizes"), py::arg("update_cache_indices"), py::arg("update_block_nums"), 
             py::arg("searched_clusters"))
         .def("set_kv", &WaveBufferCPU::set_kv, 

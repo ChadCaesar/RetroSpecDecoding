@@ -275,7 +275,7 @@ class LLM:
                 draft_token = output_ids
                 draft_attn_outs = []
                 draft_tokens = []
-                actual_stride = min(self.kv_cache.spec_stride, self.max_length-self.kv_cache.context-1)
+                actual_stride = min(self.kv_cache.spec_stride, self.max_new_length-generated_len-1, self.kv_cache.static_stride-self.kv_cache.static_pattern_total)
                 if actual_stride <= 0:
                     break
                 for _ in range(actual_stride):

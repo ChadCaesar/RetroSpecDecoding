@@ -125,6 +125,7 @@ class specdecoder_cache(KV_Cache):
         self.nprobe = min(self.nprobe, self.n_centroids)
         # estimation zone size (count by clusters)
         self.es_cluster_num = min(round(self.n_centroids*estimation_budget), self.n_centroids-self.nprobe)
+        self.max_nprobe = self.nprobe + self.nprobe_new
         # retrieve zone + estimation zone size
         self.max_compute_cluster_num = self.es_cluster_num + self.nprobe
         assert self.max_compute_cluster_num <= self.n_centroids, \
@@ -198,6 +199,11 @@ class specdecoder_cache(KV_Cache):
             torch.zeros((self.batch_groups), dtype=torch.int32, pin_memory=True).contiguous()
             for _ in range(self.layer_num)
         ]
+        # pin memory for draft estimate masks (unit == cluster)
+        self.draft_estimate_masks = [
+            torch.zeros((self.batch_groups, self.max_nprobe), dtype=torch.int32, pin_memory=True,).contiguous()
+            for _ in range(self.layer_num)
+        ]
         # pin memory for cache update cluster indices (unit == page)
         self.update_buffer_indices = [
             torch.zeros((self.batch_groups, self.buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
@@ -222,6 +228,7 @@ class specdecoder_cache(KV_Cache):
             self.wave_buffer[ldx].set_indices(
                 self.hit_unit_idices[ldx], self.hit_unit_sizes[ldx], self.hit_unit_sizes_cumsum[ldx], self.hit_num_units[ldx],
                 self.miss_unit_idices[ldx], self.miss_unit_sizes[ldx], self.miss_unit_sizes_cumsum[ldx], self.miss_num_units[ldx],
+                self.draft_estimate_masks[ldx],
                 self.update_buffer_indices[ldx], self.update_unit_sizes[ldx], self.update_cache_indices[ldx], self.update_num_units[ldx], 
                 self.cluster_ids
             )
@@ -350,6 +357,8 @@ class specdecoder_cache(KV_Cache):
         self.gemm_o_dict, self.softmax_o_dict, self.norm_dict, self.sum_dict, self.dist_dict = {}, {}, {}, {}, {}
         self.cI_dict, self.cV_dict = {}, {}
         self.es_centroids_dict, self.es_value_sum_dict, self.es_cluster_size_dict= {}, {}, {}
+        self.draft_estimate_mask_dict, self.draft_miss_cluster_ids_dict, self.draft_miss_counts_dict = {}, {}, {}
+        self.miss_centroids_dict, self.miss_value_sum_dict, self.miss_cluster_size_dict = {}, {}, {}
         self.execution_buffer_keys_dict, self.execution_buffer_values_dict, self.valid_lengths_dict = {}, {}, {}
         self.static_len_tensor_dict = {}
         
@@ -390,6 +399,26 @@ class specdecoder_cache(KV_Cache):
                 (self.batch_groups, 1, 1, self.es_cluster_num), dtype=self.dtype, device=device_idx
             ).contiguous()
             
+            # draft miss estimation zone
+            self.draft_estimate_mask_dict[device_idx] = torch.zeros(
+                (self.batch_groups, self.max_nprobe), dtype=torch.int32, device=device_idx,
+            ).contiguous()
+            self.draft_miss_cluster_ids_dict[device_idx] = torch.zeros(
+                (self.batch_groups, self.max_nprobe), dtype=torch.int64, device=device_idx,
+            ).contiguous()
+            self.draft_miss_counts_dict[device_idx] = torch.zeros(
+                (self.batch_groups,), dtype=torch.int32, device=device_idx,
+            ).contiguous()
+            self.miss_centroids_dict[device_idx] = torch.zeros(
+                (self.batch_groups, self.max_nprobe, 1, self.head_dim), dtype=self.dtype, device=device_idx,
+            ).contiguous()
+            self.miss_value_sum_dict[device_idx] = torch.zeros(
+                (self.batch_groups, self.max_nprobe, 1, self.head_dim), dtype=self.dtype, device=device_idx,
+            ).contiguous()
+            self.miss_cluster_size_dict[device_idx] = torch.zeros(
+                (self.batch_groups, 1, 1, self.max_nprobe), dtype=self.dtype, device=device_idx,
+            ).contiguous()
+
             # execution buffer
             self.execution_buffer_keys_dict[device_idx] = torch.zeros(
                 (self.batch_groups, self.buffer_size*self.page_size+self.static_stride, 1, self.head_dim), 
@@ -418,6 +447,12 @@ class specdecoder_cache(KV_Cache):
         self.es_centroids = self.es_centroids_dict[self.layer_mapping[str(0)]]
         self.es_value_sum = self.es_value_sum_dict[self.layer_mapping[str(0)]]
         self.es_cluster_size = self.es_cluster_size_dict[self.layer_mapping[str(0)]]
+        self.draft_estimate_mask = self.draft_estimate_mask_dict[self.layer_mapping[str(0)]]
+        self.draft_miss_cluster_ids = self.draft_miss_cluster_ids_dict[self.layer_mapping[str(0)]]
+        self.draft_miss_counts = self.draft_miss_counts_dict[self.layer_mapping[str(0)]]
+        self.miss_centroids = self.miss_centroids_dict[self.layer_mapping[str(0)]]
+        self.miss_value_sum = self.miss_value_sum_dict[self.layer_mapping[str(0)]]
+        self.miss_cluster_size = self.miss_cluster_size_dict[self.layer_mapping[str(0)]]
         self.execution_buffer_keys = self.execution_buffer_keys_dict[self.layer_mapping[str(0)]]
         self.execution_buffer_values = self.execution_buffer_values_dict[self.layer_mapping[str(0)]]
         self.valid_lengths = self.valid_lengths_dict[self.layer_mapping[str(0)]]
@@ -690,10 +725,6 @@ class specdecoder_cache(KV_Cache):
         value_states,       # (bsz, seq_len(=1), group_num, dim)
         layer_idx
     ):
-        # index update when generate tokens exceed UPDATE_SEGMENT
-        if not self.spec_draft_mode and self.static_pattern_total == self.static_pattern_start + self.static_pattern_end + self.UPDATE_SEGMENT:
-            self._update_kv_cache()
-
         # append newly generated token to the steady zone
         self.steady_zone_keys[layer_idx][:, :, self.static_pattern_total, :] = key_states[:, 0, :, :]
         self.steady_zone_values[layer_idx][:, :, self.static_pattern_total, :] = value_states[:, 0, :, :]
@@ -725,6 +756,9 @@ class specdecoder_cache(KV_Cache):
     
     
     def begin_draft(self):
+        # index update when generate tokens exceed UPDATE_SEGMENT
+        if self.will_update_index and self.static_pattern_total == self.static_pattern_start + self.static_pattern_end + self.UPDATE_SEGMENT:
+            self._update_kv_cache()
         self._saved_context = self.context
         self._saved_static_pattern_total = self.static_pattern_total
         self.spec_draft_mode = True
@@ -762,24 +796,50 @@ class specdecoder_cache(KV_Cache):
         if layer_idx == self.layer_num - 1:
             self.draft_step += 1
 
-        # estimation zone attention computation
-        gather_copy_vectors(
-            self.centroids[layer_idx], self.es_centroids,
-            self.value_sum[layer_idx], self.es_value_sum,
-            self.cluster_size[layer_idx], self.es_cluster_size,
-            self.cI, self.batch_groups, self.n_centroids,
-            self.es_cluster_num, self.max_compute_cluster_num,
-            0, self.es_cluster_num
-        )
-        es_out, es_lse = weighted_flash_decoding(
-            queries.view(self.batch_groups, 1, self.group_size, self.head_dim),
-            self.es_centroids, self.es_value_sum, self.es_cluster_size,
-            previous_out=None, previous_lse=None,
-            return_softmax_lse=True
-        )
-
         self.wave_buffer[layer_idx].batch_access_gpu_only()
 
+        # estimation zone attention computation
+        if self.es_cluster_num > 0:
+            gather_copy_vectors(
+                self.centroids[layer_idx], self.es_centroids,
+                self.value_sum[layer_idx], self.es_value_sum,
+                self.cluster_size[layer_idx], self.es_cluster_size,
+                self.cI, self.batch_groups, self.n_centroids,
+                self.es_cluster_num, self.max_compute_cluster_num,
+                self.nprobe, self.es_cluster_num
+            )
+            es_out, es_lse = weighted_flash_decoding(
+                queries.view(self.batch_groups, 1, self.group_size, self.head_dim),
+                self.es_centroids, self.es_value_sum, self.es_cluster_size,
+                previous_out=None, previous_lse=None,
+                return_softmax_lse=True
+            )
+        else:
+            es_out, es_lse = None, None
+
+        # miss zone(estimation) attention computation
+        self.draft_estimate_mask.copy_(self.draft_estimate_masks[layer_idx], non_blocking=True)
+        estimate_mask = self.draft_estimate_mask[:, :self.nprobe].bool()
+        self.draft_miss_cluster_ids[:, :self.nprobe].copy_(torch.gather(self.cI[:, :self.nprobe], dim=1, index=torch.argsort(estimate_mask.to(torch.int32), dim=-1, descending=True,)))
+        self.draft_miss_counts.copy_(estimate_mask.sum(dim=-1, dtype=torch.int32))
+        gather_copy_vectors(
+            self.centroids[layer_idx], self.miss_centroids,
+            self.value_sum[layer_idx], self.miss_value_sum,
+            self.cluster_size[layer_idx], self.miss_cluster_size,
+            self.draft_miss_cluster_ids, self.batch_groups, self.n_centroids,
+            self.max_nprobe, self.max_nprobe,
+            0, self.nprobe
+        )
+        if torch.any(self.draft_miss_counts > 0):
+            es_out, es_lse = weighted_flash_decoding(
+                queries.view(self.batch_groups, 1, self.group_size, self.head_dim,),
+                self.miss_centroids, self.miss_value_sum, self.miss_cluster_size,
+                previous_out=es_out, previous_lse=es_lse,
+                cache_seqlens=self.draft_miss_counts,
+                return_softmax_lse=True,
+            )
+
+        # steady zone + hit zone(retrieve) attention computation
         gather_copy_and_concat(
             self.steady_zone_keys[layer_idx], self.list_keys[layer_idx],
             self.cache_keys[layer_idx], self.execution_buffer_keys,
