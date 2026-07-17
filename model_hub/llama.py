@@ -262,7 +262,7 @@ class LlamaModel(LLM):
                     cache_ratio = specdecoder_config["cache_ratio"],
                     buffer_cluster_num = specdecoder_config["buffer_cluster_num"],
                     use_cuda_graph = specdecoder_config["use_cuda_graph"],
-                    spec_stride = specdecoder_config["spec_stride"],
+                    spec_stride = specdecoder_config["max_draft_stride"],
                     prefill_bsz = self.prefill_bsz,
                     num_gpus = self.num_gpus,
                     model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)),

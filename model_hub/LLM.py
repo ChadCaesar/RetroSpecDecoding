@@ -169,11 +169,33 @@ class LLM:
         return output_ids
 
 
+    def should_stop_draft(self, draft_count, draft_margin, draft_margin_drop):
+        if draft_count < self.min_draft_stride:
+            return False, None
+
+        stop_reasons = []
+
+        margin_enabled = self.draft_margin_threshold >= 0.0
+        if margin_enabled and draft_margin <= self.draft_margin_threshold:
+            stop_reasons.append("margin")
+
+        margin_drop_enabled = self.draft_margin_drop_threshold >= 0.0
+        if margin_drop_enabled and draft_margin_drop is not None and draft_margin_drop >= self.draft_margin_drop_threshold:
+            stop_reasons.append("margin_drop")
+
+        if len(stop_reasons) == 0:
+            return False, None
+        return True, "+".join(stop_reasons)
+
+
     def draft(self, input_ids, draft_length, do_sample=False, temperature=0.6, top_p=0.95, top_k=20):
         draft_logits_list = []
         draft_attn_outs = []
         draft_tokens = []
         draft_token = input_ids
+        draft_metrics = []
+        previous_margin = None
+        stop_reason = "length_limit"
 
         self.kv_cache.begin_draft()
         try:
@@ -184,11 +206,35 @@ class LLM:
                 draft_logits_list.append(draft_logits)
                 draft_attn_outs.append(draft_attn_out)
                 draft_tokens.append(draft_token)
-                print(colored(f"{draft_token.item()}", 'blue'), end=" ")
+                print(colored(f"{draft_token.item()}", 'blue'), end="")
+
+                draft_logits_fp32 = draft_logits.detach().float().squeeze(1)
+                draft_top2 = torch.topk(draft_logits_fp32, k=2, dim=-1)
+                draft_margin = draft_top2.values[:, 0] - draft_top2.values[:, 1]
+                if previous_margin is None:
+                    draft_margin_drop = None
+                    draft_margin_drop_value = None
+                    draft_margin_drop_text = "-"
+                else:
+                    draft_margin_drop = (previous_margin - draft_margin).clamp_min(0.0) / previous_margin.abs().clamp_min(1e-6)
+                    draft_margin_drop_value = draft_margin_drop.mean().item()
+                    draft_margin_drop_text = round(draft_margin_drop_value, 4)
+                draft_metrics.append({
+                    "draft_margin": draft_margin.mean().item(),
+                    "draft_margin_drop": draft_margin_drop_value
+                })
+                previous_margin = draft_margin.detach()
+                print(colored(f"({round(draft_margin.mean().item(), 4)}, {draft_margin_drop_text})", "cyan"), end=" ")
+
+                should_stop, metric_stop_reason = self.should_stop_draft(len(draft_tokens), draft_margin.mean().item(), draft_margin_drop_value)
+                if should_stop:
+                    stop_reason = metric_stop_reason
+                    break
         finally:
             self.kv_cache.end_draft()
 
-        return draft_logits_list, draft_attn_outs, draft_tokens
+        print(colored(f"Draft stopped by {stop_reason}", "green" if stop_reason == "length_limit" else "red"))
+        return draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics
 
 
     def compute_stability_ratio(self, draft_logits, verify_logits):
@@ -219,17 +265,27 @@ class LLM:
             print(f"\n{group_name}: no samples")
             return
 
-        metric_names = ["attention_mean", "gap_linf", "verify_margin", "stability_ratio"]
+        metric_names = ["attention_mean", "gap_linf", "verify_margin", "stability_ratio", "draft_margin", "draft_margin_drop"]
 
         print(f"\n{group_name}: count={len(records)}")
 
         for metric_name in metric_names:
-            values = torch.tensor([record[metric_name] for record in records], dtype=torch.float64)
+            raw_values = [
+                record[metric_name]
+                for record in records
+                if record.get(metric_name) is not None
+            ]
+            if len(raw_values) == 0:
+                print(f"  {metric_name}: no valid samples")
+                continue
+
+            values = torch.tensor(raw_values, dtype=torch.float64)
             quantiles = torch.quantile(values, torch.tensor([0.25, 0.50, 0.75], dtype=values.dtype))
             q25, median, q75 = quantiles.tolist()
 
             print(
                 f"  {metric_name}: "
+                f"n={len(values)}, "
                 f"mean={values.mean().item():.4f}, "
                 f"median={median:.4f}, "
                 f"q25={q25:.4f}, "
@@ -247,7 +303,7 @@ class LLM:
         )
 
 
-    def verify(self, input_ids, draft_logits_list, draft_attn_outs, draft_tokens, decode_mode, do_sample=False, temperature=0.6, top_p=0.95, top_k=20):
+    def verify(self, input_ids, draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics, decode_mode, do_sample=False, temperature=0.6, top_p=0.95, top_k=20):
         verify_logits_list = []
         verify_attn_outs = []
         verify_tokens = []
@@ -276,7 +332,9 @@ class LLM:
                 "attention_mean": attn_sim.mean().item(),
                 "gap_linf": gap_linf.mean().item(),
                 "verify_margin": verify_margin.mean().item(),
-                "stability_ratio": stability_ratio.mean().item()
+                "stability_ratio": stability_ratio.mean().item(),
+                "draft_margin": draft_metrics[i]["draft_margin"],
+                "draft_margin_drop": draft_metrics[i]["draft_margin_drop"]
             }
 
             if accept:
@@ -344,10 +402,10 @@ class LLM:
                 actual_stride = min(self.kv_cache.spec_stride, self.max_new_length-generated_len-1, self.kv_cache.static_stride-self.kv_cache.static_pattern_total)
                 if actual_stride <= 0:
                     break
-                draft_logits_list, draft_attn_outs, draft_tokens = self.draft(input_ids=output_ids, draft_length=actual_stride, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics = self.draft(output_ids, actual_stride, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                 draft_num += len(draft_tokens)
                 # Verify 阶段
-                verify_logits_list, verify_attn_outs, verify_tokens, accepted_metrics, rejected_metrics = self.verify(input_ids=output_ids, draft_logits_list=draft_logits_list, draft_attn_outs=draft_attn_outs, draft_tokens=draft_tokens, decode_mode="verify_full", do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                verify_logits_list, verify_attn_outs, verify_tokens, accepted_metrics, rejected_metrics = self.verify(output_ids, draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics, "verify_full", do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                 verify_num += len(accepted_metrics)
                 reject_num += len(rejected_metrics)
                 accepted_metrics_list.extend(accepted_metrics)
@@ -408,6 +466,16 @@ class LLM:
         self.max_new_length = max_new_length
         assert self.input_length + self.max_new_length <= self.max_length, \
             f"Error: input_length({self.input_length}) + max_new_length({self.max_new_length}) exceeds max_length({self.max_length})"
+
+        # draft 阶段相关配置
+        if self.attention_type == "SpecDecoder":
+            spec_config = attn_config["SpecDecoder"]
+            self.min_draft_stride = spec_config["min_draft_stride"]
+            self.max_draft_stride = spec_config["max_draft_stride"]
+            self.draft_margin_threshold = spec_config["draft_margin_threshold"]
+            self.draft_margin_drop_threshold = spec_config["draft_margin_drop_threshold"]
+            if not 1 <= self.min_draft_stride <= self.max_draft_stride:
+                raise ValueError(f"min_draft_stride should be in [1, max_draft_stride] but got min_draft_stride={self.min_draft_stride} and max_draft_stride={self.max_draft_stride}")
 
         # compute valid start position for each sequence
         valid_start = attention_masks.shape[1] - torch.sum(attention_masks, dim=-1).detach().cpu().numpy()

@@ -15,7 +15,10 @@ def add_config_args(parser):
 
 
 def add_spec_args(parser):
-    parser.add_argument("--spec_stride", type=int, default=9, help="Number of draft tokens per speculative step")
+    parser.add_argument("--min_draft_stride", type=int, default=3, help="Min number of draft tokens per speculative step")
+    parser.add_argument("--max_draft_stride", type=int, default=9, help="Max number of draft tokens per speculative step")
+    parser.add_argument("--draft_margin_threshold", type=float, default=-1.0, help="Stop draft when margin is below this value")
+    parser.add_argument("--draft_margin_drop_threshold", type=float, default=-1.0, help="Stop draft when margin drop ratio exceeds this value")
     return parser
 
 
@@ -40,7 +43,8 @@ def get_numa_node_core_count(node_id=0):
 def generate_config(
     model_name, context_len, attn_type, 
     retrieval_budget=0.018, estimation_budget=0.232, cache_ratio=0.0,
-    use_cuda_graph=False, gpu_only=False, spec_stride=5
+    use_cuda_graph=False, gpu_only=False,
+    min_draft_stride=3, max_draft_stride=9, draft_margin_threshold=-1.0, draft_margin_drop_threshold=-1.0
 ):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     MODEL_NAME = model_name.split("/")[-1]+'.json'
@@ -58,7 +62,7 @@ def generate_config(
     upper = lower + n_factor
     n_clusters = lower if abs(n_clusters - lower) <= abs(n_clusters - upper) else upper
 
-    if attn_type in ['RetroInfer', 'SpecDecoder']:
+    if attn_type == 'RetroInfer':
         _config[attn_type]['core'] = get_numa_node_core_count(0)
         _config[attn_type]['n_centroids'] = n_clusters
         _config[attn_type]['n_segment'] = n_segments
@@ -70,8 +74,22 @@ def generate_config(
             _config[attn_type]['buffer_cluster_num'] = 150
         _config[attn_type]['use_cuda_graph'] = use_cuda_graph
         _config[attn_type]['gpu_only'] = gpu_only
-        if attn_type == 'SpecDecoder':
-            _config[attn_type]['spec_stride'] = spec_stride
+    elif attn_type == "SpecDecoder":
+        _config[attn_type]['core'] = get_numa_node_core_count(0)
+        _config[attn_type]['n_centroids'] = n_clusters
+        _config[attn_type]['n_segment'] = n_segments
+        _config[attn_type]['pages_per_cluster'] = round(avg_cluster_size / 8)
+        _config[attn_type]['retrieval_budget'] = retrieval_budget
+        _config[attn_type]['estimation_budget'] = estimation_budget
+        _config[attn_type]['cache_ratio'] = cache_ratio
+        if context_len <= 4096:
+            _config[attn_type]['buffer_cluster_num'] = 150
+        _config[attn_type]['use_cuda_graph'] = use_cuda_graph
+        _config[attn_type]['gpu_only'] = gpu_only
+        _config[attn_type]['min_draft_stride'] = min_draft_stride
+        _config[attn_type]['max_draft_stride'] = max_draft_stride
+        _config[attn_type]['draft_margin_threshold'] = draft_margin_threshold
+        _config[attn_type]['draft_margin_drop_threshold'] = draft_margin_drop_threshold
     
     if attn_type != "Full_Flash_Attn":
         print(_config[attn_type])

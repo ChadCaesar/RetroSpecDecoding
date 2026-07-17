@@ -82,7 +82,8 @@ if __name__ == "__main__":
 
     attn_config = generate_config(model_name, input_len, attn_type, 
                                   float(args.retrieval_budget), float(args.estimation_budget), float(args.cache_ratio),
-                                  args.use_cuda_graph, args.gpu_only, args.spec_stride)
+                                  args.use_cuda_graph, args.gpu_only,
+                                  args.min_draft_stride, args.max_draft_stride, args.draft_margin_threshold, args.draft_margin_drop_threshold)
     llm = load_model(model_name, max_len, dtype, device, tokenizer)
 
     out = llm.generate(
