@@ -77,7 +77,7 @@ class LLM:
 
     def layer_decode(self, layer_idx, hidden_states, decode_mode=None):
         # print(f'Layer = {layer_idx}')
-        verify_full = self.attention_type == "SpecDecoder" and decode_mode == "verify_full"
+        full_verify = self.attention_type == "SpecDecoder" and decode_mode == "full_verify"
 
         residual = hidden_states
         bsz, seq_len, dim = hidden_states.shape
@@ -87,13 +87,13 @@ class LLM:
         hidden_states = self.layernorm(hidden_states, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
         
         query_states, key_states, value_states = self.wqkv(hidden_states, layer)
-        query_states, key_states = self.position_embedd(query_states, key_states) if not verify_full else self.position_embedd(query_states, key_states, kv_cache=self.verify_kv_cache)
+        query_states, key_states = self.position_embedd(query_states, key_states) if not full_verify else self.position_embedd(query_states, key_states, kv_cache=self.verify_kv_cache)
 
         query_states = query_states.view(bsz, seq_len, self.num_heads, self.head_dim)
         key_states = key_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
-        if verify_full:
+        if full_verify:
             self.kv_cache.decode_update_kv_cache(key_states, value_states, layer_idx)
             key_states, value_states = self.verify_kv_cache.decode_update_kv_cache(key_states, value_states, layer_idx)
         else:
@@ -392,11 +392,15 @@ class LLM:
         elif self.attention_type == "SpecDecoder":
             generated_len = 0
             draft_num = 0
-            verify_num = 0
-            reject_num = 0
+            sparse_accept_num = 0
+            sparse_reject_num = 0
+            full_accept_num = 0
+            full_reject_num = 0
             step_num = 0
-            accepted_metrics_list = []
-            rejected_metrics_list = []
+            sparse_accepted_metrics_list = []
+            sparse_rejected_metrics_list = []
+            full_accepted_metrics_list = []
+            full_rejected_metrics_list = []
             while generated_len < self.max_new_length-1:
                 # Draft 阶段
                 actual_stride = min(self.kv_cache.spec_stride, self.max_new_length-generated_len-1, self.kv_cache.static_stride-self.kv_cache.static_pattern_total)
@@ -404,17 +408,39 @@ class LLM:
                     break
                 draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics = self.draft(output_ids, actual_stride, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                 draft_num += len(draft_tokens)
-                # Verify 阶段
-                verify_logits_list, verify_attn_outs, verify_tokens, accepted_metrics, rejected_metrics = self.verify(output_ids, draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics, "verify_full", do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
-                verify_num += len(accepted_metrics)
-                reject_num += len(rejected_metrics)
-                accepted_metrics_list.extend(accepted_metrics)
-                rejected_metrics_list.extend(rejected_metrics)
-                for verify_token in verify_tokens:
-                    outputs_ids.append(verify_token)
+
+                # Sparse Verify 阶段
+                print("Sparse verify: ", end="")
+                self.kv_cache.begin_verify()
+                sparse_logits_list, sparse_attn_outs, sparse_tokens, sparse_accepted_metrics, sparse_rejected_metrics = self.verify(output_ids, draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics, "sparse_verify", do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                sparse_accept_num += len(sparse_accepted_metrics)
+                sparse_reject_num += len(sparse_rejected_metrics)
+                sparse_accepted_metrics_list.extend(sparse_accepted_metrics)
+                sparse_rejected_metrics_list.extend(sparse_rejected_metrics)
+
+                sparse_metric_records = sparse_accepted_metrics + sparse_rejected_metrics
+                sparse_mismatch = len(sparse_rejected_metrics) > 0
+                max_sparse_stability_ratio = max(record["stability_ratio"] for record in sparse_metric_records)
+
+                self.kv_cache.end_verify()
+
+                # Full Verify 阶段
+                print("Full verify: ", end="")
+                full_logits_list, full_attn_outs, full_tokens, full_accepted_metrics, full_rejected_metrics = self.verify(output_ids, sparse_logits_list, sparse_attn_outs, sparse_tokens, draft_metrics[:len(sparse_tokens)], "full_verify", do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                full_accept_num += len(full_accepted_metrics)
+                full_reject_num += len(full_rejected_metrics)
+                full_accepted_metrics_list.extend(full_accepted_metrics)
+                full_rejected_metrics_list.extend(full_rejected_metrics)
+
+                full_mismatch = len(full_rejected_metrics) > 0
+                print()
+                print(f"sparse_mismatch={sparse_mismatch}, full_mismatch={full_mismatch}, max_sparse_stability_ratio={max_sparse_stability_ratio:.4f}")
+
+                for full_token in full_tokens:
+                    outputs_ids.append(full_token)
                     generated_len += 1
                     if not ignore_eos:
-                        end_of_text |= (verify_token == eos_token)
+                        end_of_text |= (full_token == eos_token)
                         if end_of_text.all():
                             print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
                             break
@@ -422,12 +448,24 @@ class LLM:
                         break
                 if not ignore_eos and end_of_text.all():
                     break
-                output_ids = verify_tokens[-1]
+                output_ids = full_tokens[-1]
                 step_num += 1
                 print()
-            print(colored(f"Draft tokens: {draft_num}, Verify tokens: {verify_num}, Generate steps: {step_num}, Accept rate: {round(100 * verify_num / max(verify_num + reject_num, 1), 2)} %, Accept tokens per step: {round((verify_num / max(step_num, 1)), 2)}", 'green'))
-            self.print_metric_summary("Accepted group", accepted_metrics_list)
-            self.print_metric_summary("Rejected group", rejected_metrics_list)
+            print(
+                colored(
+                    f"Draft tokens: {draft_num}, "
+                    f"Sparse accept tokens: {sparse_accept_num}, "
+                    f"Sparse reject tokens: {sparse_reject_num}, "
+                    f"Full accept tokens: {full_accept_num}, "
+                    f"Full reject tokens: {full_reject_num}, "
+                    f"Generate steps: {step_num}",
+                    "green",
+                )
+            )
+            self.print_metric_summary("Draft vs Sparse - Accepted group", sparse_accepted_metrics_list)
+            self.print_metric_summary("Draft vs Sparse - Rejected group", sparse_rejected_metrics_list)
+            self.print_metric_summary("Sparse vs Full - Accepted group", full_accepted_metrics_list)
+            self.print_metric_summary("Sparse vs Full - Rejected group", full_rejected_metrics_list)
 
         torch.cuda.synchronize()
         decode_end = time.time()
