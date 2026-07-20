@@ -336,7 +336,6 @@ class LlamaModel(LLM):
             attn_out = retroinfer_decode_attn(query_states, layer_idx, self.kv_cache)
         elif self.attention_type == 'SpecDecoder':
             if decode_mode == "full_verify":
-                specdecoder_decode_attn(query_states, layer_idx, self.kv_cache)
                 attn_out = full_decode_attn(query_states, key_states, value_states, layer_idx, self.verify_kv_cache)
             elif decode_mode in ['draft', 'sparse_verify']:
                 attn_out = specdecoder_decode_attn(query_states, layer_idx, self.kv_cache)

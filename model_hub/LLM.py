@@ -188,6 +188,32 @@ class LLM:
         return True, "+".join(stop_reasons)
 
 
+    def should_trigger_full_verify(self, generated_len, pending_sparse_count, sparse_accepted_metrics, sparse_rejected_metrics):
+        trigger_reasons = []
+        sparse_metric_records = sparse_accepted_metrics + sparse_rejected_metrics
+
+        if pending_sparse_count >= self.max_sparse_stride:
+            trigger_reasons.append("pend_limit")
+
+        if generated_len + pending_sparse_count >= self.max_new_length - 1:
+            trigger_reasons.append("generate_limit")
+
+        if len(sparse_rejected_metrics) > 0:
+            trigger_reasons.append("sparse_mismatch")
+
+        max_sparse_stability_ratio = max(record["stability_ratio"] for record in sparse_metric_records)
+        if max_sparse_stability_ratio >= self.sparse_stability_threshold:
+            trigger_reasons.append("stability_ratio")
+
+        should_update_index = self.kv_cache.static_pattern_total >= self.kv_cache.static_pattern_start + self.kv_cache.static_pattern_end + self.kv_cache.UPDATE_SEGMENT
+        if self.kv_cache.will_update_index and should_update_index:
+            trigger_reasons.append("index_update")
+
+        if len(trigger_reasons) == 0:
+            return False, None
+        return True, "+".join(trigger_reasons)
+
+
     def draft(self, input_ids, draft_length, do_sample=False, temperature=0.6, top_p=0.95, top_k=20):
         draft_logits_list = []
         draft_attn_outs = []
@@ -399,42 +425,62 @@ class LLM:
             step_num = 0
             sparse_accepted_metrics_list = []
             sparse_rejected_metrics_list = []
+            pending_sparse_logits_list = []
+            pending_sparse_attn_outs = []
+            pending_sparse_tokens = []
+            pending_sparse_draft_metrics = []
             full_accepted_metrics_list = []
             full_rejected_metrics_list = []
+
             while generated_len < self.max_new_length-1:
                 # Draft 阶段
-                actual_stride = min(self.kv_cache.spec_stride, self.max_new_length-generated_len-1, self.kv_cache.static_stride-self.kv_cache.static_pattern_total)
+                actual_stride = min(
+                    self.kv_cache.spec_stride,
+                    self.max_new_length-generated_len-len(pending_sparse_tokens)-1,
+                    self.max_sparse_stride-len(pending_sparse_tokens),
+                    self.kv_cache.static_stride-self.kv_cache.static_pattern_total
+                )
                 if actual_stride <= 0:
                     break
-                draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics = self.draft(output_ids, actual_stride, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                draft_input_ids = pending_sparse_tokens[-1] if len(pending_sparse_tokens) > 0 else output_ids
+                draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics = self.draft(draft_input_ids, actual_stride, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                 draft_num += len(draft_tokens)
 
                 # Sparse Verify 阶段
                 print("Sparse verify: ", end="")
-                self.kv_cache.begin_verify()
-                sparse_logits_list, sparse_attn_outs, sparse_tokens, sparse_accepted_metrics, sparse_rejected_metrics = self.verify(output_ids, draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics, "sparse_verify", do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                if len(pending_sparse_tokens) == 0:
+                    self.kv_cache.begin_verify()
+                else:
+                    self.kv_cache.verify_block()
+                sparse_logits_list, sparse_attn_outs, sparse_tokens, sparse_accepted_metrics, sparse_rejected_metrics = self.verify(draft_input_ids, draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics, "sparse_verify", do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                 sparse_accept_num += len(sparse_accepted_metrics)
                 sparse_reject_num += len(sparse_rejected_metrics)
                 sparse_accepted_metrics_list.extend(sparse_accepted_metrics)
                 sparse_rejected_metrics_list.extend(sparse_rejected_metrics)
+                pending_sparse_logits_list.extend(sparse_logits_list)
+                pending_sparse_attn_outs.extend(sparse_attn_outs)
+                pending_sparse_tokens.extend(sparse_tokens)
+                pending_sparse_draft_metrics.extend(draft_metrics[:len(sparse_tokens)])
 
-                sparse_metric_records = sparse_accepted_metrics + sparse_rejected_metrics
-                sparse_mismatch = len(sparse_rejected_metrics) > 0
-                max_sparse_stability_ratio = max(record["stability_ratio"] for record in sparse_metric_records)
+                full_trigger, full_trigger_reasons = self.should_trigger_full_verify(generated_len, len(pending_sparse_tokens), sparse_accepted_metrics, sparse_rejected_metrics)
+                if not full_trigger:
+                    print()
+                    print("Full verify deferred")
+                    continue
 
                 self.kv_cache.end_verify()
 
                 # Full Verify 阶段
-                print("Full verify: ", end="")
-                full_logits_list, full_attn_outs, full_tokens, full_accepted_metrics, full_rejected_metrics = self.verify(output_ids, sparse_logits_list, sparse_attn_outs, sparse_tokens, draft_metrics[:len(sparse_tokens)], "full_verify", do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                print(f"Full verify by {full_trigger_reasons}: ", end="")
+                full_logits_list, full_attn_outs, full_tokens, full_accepted_metrics, full_rejected_metrics = self.verify(output_ids, pending_sparse_logits_list, pending_sparse_attn_outs, pending_sparse_tokens, pending_sparse_draft_metrics, "full_verify", do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                 full_accept_num += len(full_accepted_metrics)
                 full_reject_num += len(full_rejected_metrics)
+                pending_sparse_logits_list.clear()
+                pending_sparse_attn_outs.clear()
+                pending_sparse_tokens.clear()
+                pending_sparse_draft_metrics.clear()
                 full_accepted_metrics_list.extend(full_accepted_metrics)
                 full_rejected_metrics_list.extend(full_rejected_metrics)
-
-                full_mismatch = len(full_rejected_metrics) > 0
-                print()
-                print(f"sparse_mismatch={sparse_mismatch}, full_mismatch={full_mismatch}, max_sparse_stability_ratio={max_sparse_stability_ratio:.4f}")
 
                 for full_token in full_tokens:
                     outputs_ids.append(full_token)
@@ -512,6 +558,8 @@ class LLM:
             self.max_draft_stride = spec_config["max_draft_stride"]
             self.draft_margin_threshold = spec_config["draft_margin_threshold"]
             self.draft_margin_drop_threshold = spec_config["draft_margin_drop_threshold"]
+            self.max_sparse_stride = spec_config["max_sparse_stride"]
+            self.sparse_stability_threshold = spec_config["sparse_stability_threshold"]
             if not 1 <= self.min_draft_stride <= self.max_draft_stride:
                 raise ValueError(f"min_draft_stride should be in [1, max_draft_stride] but got min_draft_stride={self.min_draft_stride} and max_draft_stride={self.max_draft_stride}")
 

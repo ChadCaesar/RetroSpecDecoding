@@ -19,6 +19,8 @@ def add_spec_args(parser):
     parser.add_argument("--max_draft_stride", type=int, default=9, help="Max number of draft tokens per speculative step")
     parser.add_argument("--draft_margin_threshold", type=float, default=-1.0, help="Stop draft when margin is below this value")
     parser.add_argument("--draft_margin_drop_threshold", type=float, default=-1.0, help="Stop draft when margin drop ratio exceeds this value")
+    parser.add_argument("--max_sparse_stride", type=int, default=32, help="Max number of sparse-verify tokens pending full-verify")
+    parser.add_argument("--sparse_stability_threshold", type=float, default=-1.0, help="Trigger full verify when sparse stability ratio reaches this value")
     return parser
 
 
@@ -44,7 +46,8 @@ def generate_config(
     model_name, context_len, attn_type, 
     retrieval_budget=0.018, estimation_budget=0.232, cache_ratio=0.0,
     use_cuda_graph=False, gpu_only=False,
-    min_draft_stride=3, max_draft_stride=9, draft_margin_threshold=-1.0, draft_margin_drop_threshold=-1.0
+    min_draft_stride=3, max_draft_stride=9, draft_margin_threshold=-1.0, draft_margin_drop_threshold=-1.0,
+    max_sparse_stride=32, sparse_stability_threshold=-1.0
 ):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     MODEL_NAME = model_name.split("/")[-1]+'.json'
@@ -90,6 +93,8 @@ def generate_config(
         _config[attn_type]['max_draft_stride'] = max_draft_stride
         _config[attn_type]['draft_margin_threshold'] = draft_margin_threshold
         _config[attn_type]['draft_margin_drop_threshold'] = draft_margin_drop_threshold
+        _config[attn_type]['max_sparse_stride'] = max_sparse_stride
+        _config[attn_type]['sparse_stability_threshold'] = sparse_stability_threshold
     
     if attn_type != "Full_Flash_Attn":
         print(_config[attn_type])
