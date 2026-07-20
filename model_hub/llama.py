@@ -58,7 +58,7 @@ class LlamaModel(LLM):
     ) -> None:
         super().__init__(model_name, max_length, dtype, device_map)
 
-        self.local_path = os.path.join("/data/lzg/zyt/models/", model_name.split('/')[-1])
+        self.local_path = os.path.join("/home/lzg/zyt/models/", model_name.split('/')[-1])
         self.tokenizer = AutoTokenizer.from_pretrained(self.local_path) if tokenizer is None else tokenizer
         self.config = LlamaConfig.from_pretrained(self.local_path)
         self.num_layers = self.config.num_hidden_layers

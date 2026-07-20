@@ -369,6 +369,7 @@ class LLM:
                 rejected_metrics.append(metric_record)
                 break
 
+        print()
         return verify_logits_list, verify_attn_outs, verify_tokens, accepted_metrics, rejected_metrics
 
 
@@ -464,7 +465,6 @@ class LLM:
 
                 full_trigger, full_trigger_reasons = self.should_trigger_full_verify(generated_len, len(pending_sparse_tokens), sparse_accepted_metrics, sparse_rejected_metrics)
                 if not full_trigger:
-                    print()
                     print("Full verify deferred")
                     continue
 
