@@ -448,7 +448,7 @@ class LLM:
                 draft_num += len(draft_tokens)
 
                 # Sparse Verify 阶段
-                print("Sparse verify: ", end="")
+                print(colored("Sparse verify: ", 'yellow'), end="")
                 if len(pending_sparse_tokens) == 0:
                     self.kv_cache.begin_verify()
                 else:
@@ -465,13 +465,13 @@ class LLM:
 
                 full_trigger, full_trigger_reasons = self.should_trigger_full_verify(generated_len, len(pending_sparse_tokens), sparse_accepted_metrics, sparse_rejected_metrics)
                 if not full_trigger:
-                    print("Full verify deferred")
+                    print(colored("Full verify deferred", 'green'))
                     continue
 
                 self.kv_cache.end_verify()
 
                 # Full Verify 阶段
-                print(f"Full verify by {full_trigger_reasons}: ", end="")
+                print(colored(f"Full verify by {full_trigger_reasons}: ", 'yellow'), end="")
                 full_logits_list, full_attn_outs, full_tokens, full_accepted_metrics, full_rejected_metrics = self.verify(output_ids, pending_sparse_logits_list, pending_sparse_attn_outs, pending_sparse_tokens, pending_sparse_draft_metrics, "full_verify", do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                 full_accept_num += len(full_accepted_metrics)
                 full_reject_num += len(full_rejected_metrics)
