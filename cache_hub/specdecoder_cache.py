@@ -753,27 +753,42 @@ class specdecoder_cache(KV_Cache):
                 return_softmax_lse=False
             )
         return attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim)
-    
-    
+
+
     def begin_draft(self):
         # index update when generate tokens exceed UPDATE_SEGMENT
         if self.will_update_index and self.static_pattern_total == self.static_pattern_start + self.static_pattern_end + self.UPDATE_SEGMENT:
             self._update_kv_cache()
-        self._saved_context = self.context
-        self._saved_static_pattern_total = self.static_pattern_total
+        self._draft_saved_context = self.context
+        self._draft_saved_static_pattern_total = self.static_pattern_total
         self.spec_draft_mode = True
         self.attn_func = self.draft_attention
         self.draft_step = 0
-    
+
 
     def end_draft(self):
-        self.context = self._saved_context
-        self.static_pattern_total = self._saved_static_pattern_total
+        self.context = self._draft_saved_context
+        self.static_pattern_total = self._draft_saved_static_pattern_total
+
+
+    def begin_verify(self):
+        self._verify_saved_context = self.context
+        self._verify_saved_static_pattern_total = self.static_pattern_total
+        self.verify_block()
+
+
+    def verify_block(self):
         self.spec_draft_mode = False
         self.attn_func = self.verify_attention
         self.verify_step = 0
-    
-    
+
+
+    def end_verify(self):
+        self.context = self._verify_saved_context
+        self.static_pattern_total = self._verify_saved_static_pattern_total
+        self.verify_block()
+
+
     def draft_attention(self, queries, layer_idx, static_len):
         """
         Draft Attention

@@ -201,6 +201,11 @@ class retroinfer_cache(KV_Cache):
             torch.zeros((self.batch_groups), dtype=torch.int32, pin_memory=True).contiguous()
             for _ in range(self.layer_num)
         ]
+        # pin memory for draft estimate masks (unit == cluster)
+        self.estimate_masks = [
+            torch.zeros((self.batch_groups, self.nprobe + self.nprobe_new), dtype=torch.int32, pin_memory=True,).contiguous()
+            for _ in range(self.layer_num)
+        ]
         # pin memory for cache update cluster indices (unit == page)
         self.update_buffer_indices = [
             torch.zeros((self.batch_groups, self.buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
@@ -225,6 +230,7 @@ class retroinfer_cache(KV_Cache):
             self.wave_buffer[ldx].set_indices(
                 self.hit_unit_idices[ldx], self.hit_unit_sizes[ldx], self.hit_unit_sizes_cumsum[ldx], self.hit_num_units[ldx],
                 self.miss_unit_idices[ldx], self.miss_unit_sizes[ldx], self.miss_unit_sizes_cumsum[ldx], self.miss_num_units[ldx],
+                self.estimate_masks[ldx],
                 self.update_buffer_indices[ldx], self.update_unit_sizes[ldx], self.update_cache_indices[ldx], self.update_num_units[ldx], 
                 self.cluster_ids
             )

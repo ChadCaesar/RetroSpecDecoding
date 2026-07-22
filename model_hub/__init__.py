@@ -5,7 +5,7 @@ from transformers import AutoTokenizer
 
 
 def add_model_args(parser):
-    parser.add_argument("--device", type=str, default="cuda:1", help="Device, set to `auto` to split model across all available GPUs")
+    parser.add_argument("--device", type=str, default="auto", help="Device, set to `auto` to split model across all available GPUs")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"], help="Data type")
     parser.add_argument("--model_name", type=str, default="gradientai/Llama-3-8B-Instruct-Gradient-1048k",
                         choices=["gradientai/Llama-3-8B-Instruct-Gradient-1048k", "Qwen/Qwen2.5-7B-Instruct",
@@ -16,7 +16,7 @@ def add_model_args(parser):
 
 
 def load_tokenizer(model_name):
-    local_path = os.path.join("/data/lzg/zyt/models/", model_name.split('/')[-1])
+    local_path = os.path.join("/home/lzg/zyt/models/", model_name.split('/')[-1])
     tokenizer = AutoTokenizer.from_pretrained(local_path)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"

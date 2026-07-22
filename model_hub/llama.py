@@ -58,7 +58,7 @@ class LlamaModel(LLM):
     ) -> None:
         super().__init__(model_name, max_length, dtype, device_map)
 
-        self.local_path = os.path.join("/data/lzg/zyt/models/", model_name.split('/')[-1])
+        self.local_path = os.path.join("/home/lzg/zyt/models/", model_name.split('/')[-1])
         self.tokenizer = AutoTokenizer.from_pretrained(self.local_path) if tokenizer is None else tokenizer
         self.config = LlamaConfig.from_pretrained(self.local_path)
         self.num_layers = self.config.num_hidden_layers
@@ -262,7 +262,7 @@ class LlamaModel(LLM):
                     cache_ratio = specdecoder_config["cache_ratio"],
                     buffer_cluster_num = specdecoder_config["buffer_cluster_num"],
                     use_cuda_graph = specdecoder_config["use_cuda_graph"],
-                    spec_stride = specdecoder_config["spec_stride"],
+                    spec_stride = specdecoder_config["max_draft_stride"],
                     prefill_bsz = self.prefill_bsz,
                     num_gpus = self.num_gpus,
                     model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)),
@@ -281,6 +281,8 @@ class LlamaModel(LLM):
                     num_gpus = self.num_gpus,
                     model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)),
                 )
+            else:
+                raise ValueError("SpecDecoder currently only supports CPU-offloaded KV cache mode")
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
     
@@ -335,11 +337,12 @@ class LlamaModel(LLM):
         elif self.attention_type == 'RetroInfer':
             attn_out = retroinfer_decode_attn(query_states, layer_idx, self.kv_cache)
         elif self.attention_type == 'SpecDecoder':
-            if decode_mode == "verify_full":
-                specdecoder_decode_attn(query_states, layer_idx, self.kv_cache)
+            if decode_mode == "full_verify":
                 attn_out = full_decode_attn(query_states, key_states, value_states, layer_idx, self.verify_kv_cache)
-            else:
+            elif decode_mode in ['draft', 'sparse_verify']:
                 attn_out = specdecoder_decode_attn(query_states, layer_idx, self.kv_cache)
+            else:
+                raise ValueError(f"Unsupported SpecDecoder decode mode: {decode_mode}")
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
         return attn_out
