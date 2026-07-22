@@ -134,6 +134,7 @@ def main(args):
             print(result.stderr)
     except subprocess.CalledProcessError as e:
         print("Error output:", e.stderr)
+        raise SystemExit(e.returncode)
 
     save_file = args.save_dir / args.task / f"{args.subset}.jsonl"
     print(f"Prepare {args.task} with lines: {args.num_samples} to {save_file}")

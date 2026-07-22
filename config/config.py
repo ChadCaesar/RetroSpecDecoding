@@ -4,13 +4,23 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 
 def add_config_args(parser):
-    parser.add_argument("--attn_type", type=str, default="RetroInfer",
-                        choices=["Full_Flash_Attn", "RetroInfer"], help="Attention method")
+    parser.add_argument("--attn_type", type=str, default="SpecDecoder",
+                        choices=["Full_Flash_Attn", "RetroInfer", "SpecDecoder"], help="Attention method")
     parser.add_argument("--retrieval_budget", type=float, default=0.018, help="Retrieval budget")
     parser.add_argument("--estimation_budget", type=float, default=0.232, help="Estimation budget for RetroInfer")
     parser.add_argument("--cache_ratio", type=float, default=0.0, help="Cache ratio for RetroInfer")
     parser.add_argument("--use_cuda_graph", action='store_true', help="Use CUDA graph for inference")
     parser.add_argument("--gpu_only", action='store_true', help="Whether to use GPU-only mode for RetroInfer")
+    return parser
+
+
+def add_spec_args(parser):
+    parser.add_argument("--min_draft_stride", type=int, default=1, help="Min number of draft tokens per speculative step")
+    parser.add_argument("--max_draft_stride", type=int, default=16, help="Max number of draft tokens per speculative step")
+    parser.add_argument("--draft_margin_threshold", type=float, default=0.25, help="Stop draft when margin is below this value")
+    parser.add_argument("--draft_margin_drop_threshold", type=float, default=0.89, help="Stop draft when margin drop ratio exceeds this value")
+    parser.add_argument("--max_sparse_stride", type=int, default=64, help="Max number of sparse-verify tokens pending full-verify")
+    parser.add_argument("--sparse_stability_threshold", type=float, default=1.0, help="Trigger full verify when sparse stability ratio reaches this value")
     return parser
 
 
@@ -35,7 +45,9 @@ def get_numa_node_core_count(node_id=0):
 def generate_config(
     model_name, context_len, attn_type, 
     retrieval_budget=0.018, estimation_budget=0.232, cache_ratio=0.0,
-    use_cuda_graph=False, gpu_only=False
+    use_cuda_graph=False, gpu_only=False,
+    min_draft_stride=1, max_draft_stride=16, draft_margin_threshold=-1.0, draft_margin_drop_threshold=-1.0,
+    max_sparse_stride=64, sparse_stability_threshold=-1.0
 ):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     MODEL_NAME = model_name.split("/")[-1]+'.json'
@@ -65,6 +77,24 @@ def generate_config(
             _config[attn_type]['buffer_cluster_num'] = 150
         _config[attn_type]['use_cuda_graph'] = use_cuda_graph
         _config[attn_type]['gpu_only'] = gpu_only
+    elif attn_type == "SpecDecoder":
+        _config[attn_type]['core'] = get_numa_node_core_count(0)
+        _config[attn_type]['n_centroids'] = n_clusters
+        _config[attn_type]['n_segment'] = n_segments
+        _config[attn_type]['pages_per_cluster'] = round(avg_cluster_size / 8)
+        _config[attn_type]['retrieval_budget'] = retrieval_budget
+        _config[attn_type]['estimation_budget'] = estimation_budget
+        _config[attn_type]['cache_ratio'] = cache_ratio
+        if context_len <= 4096:
+            _config[attn_type]['buffer_cluster_num'] = 150
+        _config[attn_type]['use_cuda_graph'] = use_cuda_graph
+        _config[attn_type]['gpu_only'] = gpu_only
+        _config[attn_type]['min_draft_stride'] = min_draft_stride
+        _config[attn_type]['max_draft_stride'] = max_draft_stride
+        _config[attn_type]['draft_margin_threshold'] = draft_margin_threshold
+        _config[attn_type]['draft_margin_drop_threshold'] = draft_margin_drop_threshold
+        _config[attn_type]['max_sparse_stride'] = max_sparse_stride
+        _config[attn_type]['sparse_stability_threshold'] = sparse_stability_threshold
     
     if attn_type != "Full_Flash_Attn":
         print(_config[attn_type])

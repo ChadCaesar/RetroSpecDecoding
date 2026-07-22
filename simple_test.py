@@ -11,7 +11,7 @@ from termcolor import colored
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(PROJECT_ROOT)
 from model_hub import load_model, load_tokenizer, add_model_args
-from config import generate_config, add_config_args
+from config import generate_config, add_config_args, add_spec_args
 
 
 def set_seed(seed):
@@ -30,9 +30,10 @@ def parse_args():
     parser.add_argument("--do_sample", action='store_true', help="Whether to use sampling when decoding")
     parser.add_argument("--prefill_method", type=str, default="full", choices=["full", "xattn", "minfer"], 
                         help="Prefilling method")
-    parser.add_argument("--data_path", type=str, default="simple_test_data.json", help="Input json file path")
+    parser.add_argument("--data_path", type=str, default="spec_test_data.json", help="Input json file path")
     parser = add_model_args(parser)
     parser = add_config_args(parser)
+    parser = add_spec_args(parser)
     args = parser.parse_args()
     
     return args
@@ -81,7 +82,9 @@ if __name__ == "__main__":
 
     attn_config = generate_config(model_name, input_len, attn_type, 
                                   float(args.retrieval_budget), float(args.estimation_budget), float(args.cache_ratio),
-                                  args.use_cuda_graph, args.gpu_only)
+                                  args.use_cuda_graph, args.gpu_only,
+                                  args.min_draft_stride, args.max_draft_stride, args.draft_margin_threshold, args.draft_margin_drop_threshold,
+                                  args.max_sparse_stride, args.sparse_stability_threshold)
     llm = load_model(model_name, max_len, dtype, device, tokenizer)
 
     out = llm.generate(

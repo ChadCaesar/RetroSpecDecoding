@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,13 +23,20 @@ fi
 # Root Directories
 ROOT_DIR="./ruler_eval_result" # the path that stores generated task samples and model predictions.
 
-NUM_SAMPLES=200
+NUM_SAMPLES=${NUM_SAMPLES:-200}
 MAX_SEQ_LENGTH=${4}
 ATTN_TYPE=${3}
 DEVICE=auto
 BUDGET_RATIO=${7}
 ESTIMATE_RATIO=${8}
 PREFILL_METHOD=${2}
+
+MIN_DRAFT_STRIDE=${MIN_DRAFT_STRIDE:-3}
+MAX_DRAFT_STRIDE=${MAX_DRAFT_STRIDE:-9}
+DRAFT_MARGIN_THRESHOLD=${DRAFT_MARGIN_THRESHOLD:--1.0}
+DRAFT_MARGIN_DROP_THRESHOLD=${DRAFT_MARGIN_DROP_THRESHOLD:--1.0}
+MAX_SPARSE_STRIDE=${MAX_SPARSE_STRIDE:-32}
+SPARSE_STABILITY_THRESHOLD=${SPARSE_STABILITY_THRESHOLD:--1.0}
 
 # Model and Tokenizer
 source ruler_config_models.sh
@@ -50,7 +58,8 @@ if [ -z "${TASKS}" ]; then
 fi
 
 # Start client (prepare data / call model API / obtain final metrics)
-RESULTS_DIR="${ROOT_DIR}/${MODEL_NAME}/${BENCHMARK}/${MAX_SEQ_LENGTH}/${ATTN_TYPE}"
+TASK=${5}
+RESULTS_DIR="${ROOT_DIR}/${MODEL_NAME}/${BENCHMARK}/${MAX_SEQ_LENGTH}/${ATTN_TYPE}/${TASK}"
 DATA_DIR="${RESULTS_DIR}/data"
 PRED_DIR="${RESULTS_DIR}/pred"
 rm -rf ${DATA_DIR}
@@ -58,7 +67,6 @@ rm -rf ${PRED_DIR}
 mkdir -p ${DATA_DIR}
 mkdir -p ${PRED_DIR}
 
-TASK=${5}
 python -u data/prepare.py \
     --save_dir ${DATA_DIR} \
     --benchmark ${BENCHMARK} \
@@ -87,7 +95,13 @@ python -u pred/call_api.py \
     --retrieval_budget ${BUDGET_RATIO} \
     --estimation_budget ${ESTIMATE_RATIO} \
     --synthetic_len ${MAX_SEQ_LENGTH} \
-    --prefill_method ${PREFILL_METHOD}
+    --prefill_method ${PREFILL_METHOD} \
+    --min_draft_stride ${MIN_DRAFT_STRIDE} \
+    --max_draft_stride ${MAX_DRAFT_STRIDE} \
+    --draft_margin_threshold ${DRAFT_MARGIN_THRESHOLD} \
+    --draft_margin_drop_threshold ${DRAFT_MARGIN_DROP_THRESHOLD} \
+    --max_sparse_stride ${MAX_SPARSE_STRIDE} \
+    --sparse_stability_threshold ${SPARSE_STABILITY_THRESHOLD}
 
 python -u eval/evaluate.py \
     --data_dir ${PRED_DIR} \

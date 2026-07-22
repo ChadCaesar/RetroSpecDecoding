@@ -13,7 +13,7 @@ sys.path.append(PROJECT_ROOT)
 from model_hub import LlamaModel, QwenModel, add_model_args
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from config import add_config_args, generate_config
+from config import add_config_args, add_spec_args, generate_config
 
 
 model2path = json.load(open("config/model2path.json", "r"))
@@ -30,16 +30,18 @@ def parse_args(args=None):
                         choices=["llama-3-8b-1048k", "qwen2.5-7b", "llama-3.1-8b", "qwen2.5-72b"])
     parser.add_argument('--e', action='store_true', help="Evaluate on LongBench-E")
     parser.add_argument('--task', type=str, required=True, help="task name. work when --e is false")
+    parser.add_argument("--start_index", type=int, default=0, help="start index in the original dataset.")
     parser.add_argument("--num_examples", type=int, default=-1, help="num of example to evaluate. -1 for all.")
 
     parser = add_model_args(parser)
     parser = add_config_args(parser)
+    parser = add_spec_args(parser)
 
     return parser.parse_args(args)
 
 
 def get_pred(llm, data, max_new_tokens, prompt_format, model_name, out_path, args):
-    for json_obj in tqdm(data):
+    for local_index, json_obj in enumerate(tqdm(data)):
         prompt = prompt_format.format(**json_obj)
 
         inputs = llm.tokenizer([prompt], return_tensors="pt", padding=True)
@@ -50,8 +52,10 @@ def get_pred(llm, data, max_new_tokens, prompt_format, model_name, out_path, arg
             model2path[model_name], 
             input_ids.shape[1], 
             attn_type,
-            retrieval_budget=args.retrieval_budget,
-            estimation_budget=args.estimation_budget,
+            float(args.retrieval_budget), float(args.estimation_budget), float(args.cache_ratio),
+            args.use_cuda_graph, args.gpu_only,
+            args.min_draft_stride, args.max_draft_stride, args.draft_margin_threshold, args.draft_margin_drop_threshold,
+            args.max_sparse_stride, args.sparse_stability_threshold
         )
 
         out = llm.generate(
@@ -74,7 +78,9 @@ def get_pred(llm, data, max_new_tokens, prompt_format, model_name, out_path, arg
         with open(out_path, "a", encoding="utf-8") as f:
             json.dump(
                 {
+                    "sample_id": args.start_index + local_index,
                     "pred": pred, 
+                    "token_ids": out[0],
                     "answers": json_obj["answers"], 
                     "all_classes": json_obj["all_classes"], 
                     "length": json_obj["length"]
@@ -120,6 +126,7 @@ if __name__ == '__main__':
     seed_everything(42)
     args = parse_args()
 
+    start_index = args.start_index
     num_examples = args.num_examples
     attn_type = args.attn_type
     model_name = args.model
@@ -163,11 +170,21 @@ if __name__ == '__main__':
         prompt_format = dataset2prompt[dataset]
         max_new_tokens = dataset2maxlen[dataset]
         data_all = [data_sample for data_sample in data]
-        data_all = data_all[:num_examples] if num_examples > 0 else data_all
+
+        if start_index < 0:
+            raise ValueError(f"start_index must be non-negative, got {start_index}")
+
+        if num_examples > 0:
+            end_index = start_index + num_examples
+            selected_data = data_all[start_index:end_index]
+            if len(selected_data) != num_examples:
+                raise ValueError(f"Requested {num_examples} samples starting from index {start_index}, but only found {len(selected_data)} samples.")
+        else:
+            selected_data = data_all[start_index:]
 
         get_pred(
             llm,
-            data_all,
+            selected_data,
             max_new_tokens,
             prompt_format,
             model_name,

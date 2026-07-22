@@ -51,7 +51,7 @@ sys.path.append(PROJECT_ROOT)
 from model_hub import LlamaModel, QwenModel, add_model_args
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
-from config import add_config_args, generate_config
+from config import add_config_args, add_spec_args, generate_config
 
 
 SERVER_TYPES = (
@@ -108,7 +108,7 @@ class HuggingFaceModel:
         self.args = args
 
     def __call__(self, prompt: str, **kwargs) -> Dict[str, List[str]]:
-        generated_text = get_pred(
+        generated_text, token_ids = get_pred(
             self.llm,
             input_text=prompt, 
             max_new_tokens=self.max_new_len,
@@ -120,7 +120,10 @@ class HuggingFaceModel:
             synthetic_len=self.synthetic_len,
             args=self.args,
         )
-        return {'text': [generated_text]}
+        return {
+            "text": [generated_text],
+            "token_ids": [token_ids],
+        }
 
 
 def get_llm(model_name, max_len, max_new_len, attn_type, dtype, 
@@ -167,8 +170,10 @@ def get_pred(
         model_name, 
         synthetic_len, 
         attn_type,
-        retrieval_budget=retrieval_budget,
-        estimation_budget=estimation_budget,
+        retrieval_budget, estimation_budget, float(args.cache_ratio),
+        args.use_cuda_graph, args.gpu_only,
+        args.min_draft_stride, args.max_draft_stride, args.draft_margin_threshold, args.draft_margin_drop_threshold,
+        args.max_sparse_stride, args.sparse_stability_threshold
     )
 
     out = llm.generate(
@@ -185,7 +190,7 @@ def get_pred(
     output = llm.tokenizer.batch_decode(out, skip_special_tokens=True)
     
     print("Chunked generation:", output[0])
-    return output[0]
+    return output[0], out[0]
 
 
 def get_output(llm, outputs_parallel, idx, index, input, outputs, others, truncation, length):
@@ -200,6 +205,7 @@ def get_output(llm, outputs_parallel, idx, index, input, outputs, others, trunca
         outputs_parallel[idx] = {
             'index': index,
             'pred': pred['text'][0],
+            "token_ids": pred["token_ids"][0],
             'input': input,
             'outputs': outputs,
             'others': others,
@@ -321,8 +327,9 @@ if __name__ == '__main__':
     parser.add_argument("--prefill_method", type=str, default="full", choices=["full", "xattn", "minfer"], 
                         help="Prefilling method")
 
-    parser = add_config_args(parser)
     parser = add_model_args(parser)
+    parser = add_config_args(parser)
+    parser = add_spec_args(parser)
 
     args = parser.parse_args()
     print(args)

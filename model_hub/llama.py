@@ -6,8 +6,8 @@ import torch.nn.functional as F
 import flashinfer
 from transformers import AutoTokenizer, LlamaForCausalLM, LlamaConfig
 from .LLM import LLM
-from cache_hub import flash_attn_cache, retroinfer_cache, retroinfer_cache_gpu
-from attn_hub import full_decode_attn, retroinfer_decode_attn, \
+from cache_hub import flash_attn_cache, retroinfer_cache, retroinfer_cache_gpu, specdecoder_cache
+from attn_hub import full_decode_attn, retroinfer_decode_attn, specdecoder_decode_attn, \
                      full_prefill_attn, prefill_xattn, prefill_minfer
 from .xattn_thresholds import llama_31_8b_8_thresholds, llama_3_8b_8_thresholds
 from .minfer_patterns import llama_31_8b_best_patterns, llama_3_8b_best_patterns
@@ -58,7 +58,7 @@ class LlamaModel(LLM):
     ) -> None:
         super().__init__(model_name, max_length, dtype, device_map)
 
-        self.local_path = os.path.join("/data/lzg/zyt/models/", model_name.split('/')[-1])
+        self.local_path = os.path.join("/home/lzg/zyt/models/", model_name.split('/')[-1])
         self.tokenizer = AutoTokenizer.from_pretrained(self.local_path) if tokenizer is None else tokenizer
         self.config = LlamaConfig.from_pretrained(self.local_path)
         self.num_layers = self.config.num_hidden_layers
@@ -160,6 +160,7 @@ class LlamaModel(LLM):
     def init_kv_cache(self, valid_start, attn_config):
         # collect memory from previous kv_cache
         self.kv_cache = None
+        self.verify_kv_cache = None
         gc.collect()
 
         llama_config = attn_config
@@ -235,9 +236,56 @@ class LlamaModel(LLM):
                     num_gpus = self.num_gpus,
                     model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1))
                 )
+        elif self.attention_type == 'SpecDecoder':
+            specdecoder_config = llama_config.get(self.attention_type)
+
+            if specdecoder_config['gpu_only'] == False:   # Offload version
+                self.kv_cache = specdecoder_cache(
+                    valid_start = valid_start,
+                    layer_num = self.num_layers,
+                    batch_size = self.batch_size,
+                    max_length = self.max_new_length + self.input_length,
+                    num_key_value_heads = self.num_key_value_heads,
+                    num_heads = self.num_heads,
+                    head_dim = self.head_dim,
+                    dtype = self.dtype,
+                    layer_mapping = self.layer_mapping,
+                    max_new_length = self.max_new_length,
+                    static_pattern_start = specdecoder_config["static_pattern_start"],
+                    static_pattern_end = specdecoder_config["static_pattern_end"],
+                    core = specdecoder_config["core"],
+                    n_centroids = specdecoder_config["n_centroids"],
+                    n_segment = specdecoder_config["n_segment"],
+                    pages_per_cluster = specdecoder_config["pages_per_cluster"],
+                    retrieval_budget = specdecoder_config["retrieval_budget"],
+                    estimation_budget = specdecoder_config["estimation_budget"],
+                    cache_ratio = specdecoder_config["cache_ratio"],
+                    buffer_cluster_num = specdecoder_config["buffer_cluster_num"],
+                    use_cuda_graph = specdecoder_config["use_cuda_graph"],
+                    spec_stride = specdecoder_config["max_draft_stride"],
+                    prefill_bsz = self.prefill_bsz,
+                    num_gpus = self.num_gpus,
+                    model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)),
+                )
+                self.verify_kv_cache = flash_attn_cache(
+                    valid_start = valid_start,
+                    layer_num = self.num_layers,
+                    batch_size = self.batch_size,
+                    max_length = self.max_new_length + self.input_length,
+                    num_key_value_heads = self.num_key_value_heads,
+                    num_heads = self.num_heads,
+                    head_dim = self.head_dim,
+                    dtype = self.dtype,
+                    layer_mapping = self.layer_mapping,
+                    prefill_bsz = self.prefill_bsz,
+                    num_gpus = self.num_gpus,
+                    model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)),
+                )
+            else:
+                raise ValueError("SpecDecoder currently only supports CPU-offloaded KV cache mode")
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
-
+    
     
     def move(self):
         torch.cuda.empty_cache()
@@ -245,6 +293,9 @@ class LlamaModel(LLM):
             self.kv_cache.move_gpu()
         elif self.attention_type == 'RetroInfer':
             self.kv_cache.prepare_cache()
+        elif self.attention_type == 'SpecDecoder':
+            self.kv_cache.prepare_cache()
+            self.verify_kv_cache.move_gpu()
         torch.cuda.empty_cache()
 
     
@@ -280,11 +331,18 @@ class LlamaModel(LLM):
         return attn_out
     
 
-    def decode_attention(self, query_states, key_states, value_states, layer_idx):
+    def decode_attention(self, query_states, key_states, value_states, layer_idx, decode_mode=None):
         if self.attention_type == 'Full_Flash_Attn':
             attn_out = full_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
         elif self.attention_type == 'RetroInfer':
-            attn_out = retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
+            attn_out = retroinfer_decode_attn(query_states, layer_idx, self.kv_cache)
+        elif self.attention_type == 'SpecDecoder':
+            if decode_mode == "full_verify":
+                attn_out = full_decode_attn(query_states, key_states, value_states, layer_idx, self.verify_kv_cache)
+            elif decode_mode in ['draft', 'sparse_verify']:
+                attn_out = specdecoder_decode_attn(query_states, layer_idx, self.kv_cache)
+            else:
+                raise ValueError(f"Unsupported SpecDecoder decode mode: {decode_mode}")
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
         return attn_out
@@ -347,6 +405,30 @@ class LlamaModel(LLM):
                         self.kv_cache.execution_buffer_keys = self.kv_cache.execution_buffer_keys_dict[next_device]
                         self.kv_cache.execution_buffer_values = self.kv_cache.execution_buffer_values_dict[next_device]
                         self.kv_cache.valid_lengths = self.kv_cache.valid_lengths_dict[next_device]
+        elif self.attention_type == 'SpecDecoder':
+            if hidden_states.shape[1] == 1:
+                self.kv_cache.cI = self.kv_cache.cI_dict[next_device]
+                self.kv_cache.static_len_tensor = self.kv_cache.static_len_tensor_dict[next_device]
+                self.kv_cache.gemm_o = self.kv_cache.gemm_o_dict[next_device]
+                self.kv_cache.softmax_o = self.kv_cache.softmax_o_dict[next_device]
+                self.kv_cache.norm = self.kv_cache.norm_dict[next_device]
+                self.kv_cache.sum = self.kv_cache.sum_dict[next_device]
+                self.kv_cache.dist = self.kv_cache.dist_dict[next_device]
+                self.kv_cache.cV = self.kv_cache.cV_dict[next_device]
+                self.kv_cache.es_centroids = self.kv_cache.es_centroids_dict[next_device]
+                self.kv_cache.es_value_sum = self.kv_cache.es_value_sum_dict[next_device]
+                self.kv_cache.es_cluster_size = self.kv_cache.es_cluster_size_dict[next_device]
+                self.kv_cache.draft_estimate_mask = self.kv_cache.draft_estimate_mask_dict[next_device]
+                self.kv_cache.draft_miss_cluster_ids = self.kv_cache.draft_miss_cluster_ids_dict[next_device]
+                self.kv_cache.draft_miss_counts = self.kv_cache.draft_miss_counts_dict[next_device]
+                self.kv_cache.miss_centroids = self.kv_cache.miss_centroids_dict[next_device]
+                self.kv_cache.miss_value_sum = self.kv_cache.miss_value_sum_dict[next_device]
+                self.kv_cache.miss_cluster_size = self.kv_cache.miss_cluster_size_dict[next_device]
+                self.verify_kv_cache.batch_indices = self.verify_kv_cache.batch_indices_dict[next_device]
+                self.verify_kv_cache.valid_length = self.verify_kv_cache.valid_length_dict[next_device]
+                self.kv_cache.execution_buffer_keys = self.kv_cache.execution_buffer_keys_dict[next_device]
+                self.kv_cache.execution_buffer_values = self.kv_cache.execution_buffer_values_dict[next_device]
+                self.kv_cache.valid_lengths = self.kv_cache.valid_lengths_dict[next_device]
         return hidden_states
 
     
@@ -369,8 +451,10 @@ class LlamaModel(LLM):
         return query_states, key_states
 
 
-    def position_embedd(self, query_states, key_states):
+    def position_embedd(self, query_states, key_states, kv_cache=None):
+        if kv_cache is None:
+            kv_cache = self.kv_cache
         bsz, seq_len, _ = key_states.shape
-        position_ids = self.position_ids[self.kv_cache.context:self.kv_cache.context+seq_len].unsqueeze(0).repeat(bsz, 1)
+        position_ids = self.position_ids[kv_cache.context:kv_cache.context+seq_len].unsqueeze(0).repeat(bsz, 1)
         query_states, key_states = self.apply_rotary_pos_emb(query_states, key_states, position_ids)
         return query_states, key_states

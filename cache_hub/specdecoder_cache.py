@@ -8,9 +8,9 @@ from .kmeans import segment_k_means
 from weighted_flash_decoding import weighted_flash_decoding
 
 
-class retroinfer_cache(KV_Cache):
+class specdecoder_cache(KV_Cache):
     """
-    A class representing the KV Cache of RetroInfer.
+    A class representing the KV Cache of SpecDecoder.
     """
 
     def __init__(
@@ -36,6 +36,7 @@ class retroinfer_cache(KV_Cache):
         cache_ratio: float,         # ratio of cache size to sequence length
         buffer_cluster_num: int,    # number of clusters in the buffer
         use_cuda_graph: bool,
+        spec_stride: int,
         prefill_bsz: int,
         num_gpus: int,
         model_size: int
@@ -124,28 +125,25 @@ class retroinfer_cache(KV_Cache):
         self.nprobe = min(self.nprobe, self.n_centroids)
         # estimation zone size (count by clusters)
         self.es_cluster_num = min(round(self.n_centroids*estimation_budget), self.n_centroids-self.nprobe)
+        self.max_nprobe = self.nprobe + self.nprobe_new
         # retrieve zone + estimation zone size
         self.max_compute_cluster_num = self.es_cluster_num + self.nprobe
         assert self.max_compute_cluster_num <= self.n_centroids, \
             f"max_compute_cluster_num({self.max_compute_cluster_num}) should <= n_centroids({self.n_centroids})"
         print(f"Initial n_centroids: {self.n_centroids}, nprobe: {self.nprobe}, es_cluster_num: {self.es_cluster_num}")
 
-        # CUDA graphs
-        self.use_cuda_graph = use_cuda_graph
-        if self.will_update_index:   # need update when decoding
-            if self.use_cuda_graph:
-                print("Index will be updated during decoding, so CUDA Graph will be disabled.")
-            self.use_cuda_graph = False
-        elif not self.build_index_when_prefilling:  # not build index during prefilling and not update during decoding
-            if self.use_cuda_graph:
-                print("Input + output length too small, fall back to full attention, so CUDA Graph will be disabled.")
-            self.use_cuda_graph = False
-        if self.use_cuda_graph:
-            self.topk_cudagraphs = [torch.cuda.CUDAGraph() for _ in range(self.layer_num)]
-            if self.es_cluster_num > 0:
-                self.es_cudagraphs = [torch.cuda.CUDAGraph() for _ in range(self.layer_num)]
-            self.attn_cudagraphs = [torch.cuda.CUDAGraph() for _ in range(self.layer_num)]
-            self.update_cudagraphs = [torch.cuda.CUDAGraph() for _ in range(self.layer_num)]
+        # CUDA graphs (disabled for spec decoding)
+        self.use_cuda_graph = False
+
+        # Speculative decoding config
+        self.spec_stride = spec_stride
+        self.spec_draft_mode = False
+        self.draft_topk_indices = [
+            [torch.zeros((self.batch_groups, self.max_compute_cluster_num), dtype=torch.int64,
+                          device=self.layer_mapping[str(ldx)])
+             for ldx in range(self.layer_num)]
+            for _ in range(self.spec_stride)
+        ]
 
         # calculate the GPU block cache size and compute buffer size (count by pages)
         cache_cluster_num = round((self.n_centroids + self.n_centroids_new) * cache_ratio) if cache_ratio > 0.0 \
@@ -202,8 +200,8 @@ class retroinfer_cache(KV_Cache):
             for _ in range(self.layer_num)
         ]
         # pin memory for draft estimate masks (unit == cluster)
-        self.estimate_masks = [
-            torch.zeros((self.batch_groups, self.nprobe + self.nprobe_new), dtype=torch.int32, pin_memory=True,).contiguous()
+        self.draft_estimate_masks = [
+            torch.zeros((self.batch_groups, self.max_nprobe), dtype=torch.int32, pin_memory=True,).contiguous()
             for _ in range(self.layer_num)
         ]
         # pin memory for cache update cluster indices (unit == page)
@@ -230,7 +228,7 @@ class retroinfer_cache(KV_Cache):
             self.wave_buffer[ldx].set_indices(
                 self.hit_unit_idices[ldx], self.hit_unit_sizes[ldx], self.hit_unit_sizes_cumsum[ldx], self.hit_num_units[ldx],
                 self.miss_unit_idices[ldx], self.miss_unit_sizes[ldx], self.miss_unit_sizes_cumsum[ldx], self.miss_num_units[ldx],
-                self.estimate_masks[ldx],
+                self.draft_estimate_masks[ldx],
                 self.update_buffer_indices[ldx], self.update_unit_sizes[ldx], self.update_cache_indices[ldx], self.update_num_units[ldx], 
                 self.cluster_ids
             )
@@ -359,12 +357,10 @@ class retroinfer_cache(KV_Cache):
         self.gemm_o_dict, self.softmax_o_dict, self.norm_dict, self.sum_dict, self.dist_dict = {}, {}, {}, {}, {}
         self.cI_dict, self.cV_dict = {}, {}
         self.es_centroids_dict, self.es_value_sum_dict, self.es_cluster_size_dict= {}, {}, {}
+        self.draft_estimate_mask_dict, self.draft_miss_cluster_ids_dict, self.draft_miss_counts_dict = {}, {}, {}
+        self.miss_centroids_dict, self.miss_value_sum_dict, self.miss_cluster_size_dict = {}, {}, {}
         self.execution_buffer_keys_dict, self.execution_buffer_values_dict, self.valid_lengths_dict = {}, {}, {}
         self.static_len_tensor_dict = {}
-        if self.use_cuda_graph:
-            self.query_buffer_dict = {}
-            self.es_out_dict, self.es_lse_dict = {}, {}
-            self.attn_out_dict = {}
         
         for device_idx in self.device_list:
             # for batch_gemm_softmax kernel
@@ -403,6 +399,26 @@ class retroinfer_cache(KV_Cache):
                 (self.batch_groups, 1, 1, self.es_cluster_num), dtype=self.dtype, device=device_idx
             ).contiguous()
             
+            # draft miss estimation zone
+            self.draft_estimate_mask_dict[device_idx] = torch.zeros(
+                (self.batch_groups, self.max_nprobe), dtype=torch.int32, device=device_idx,
+            ).contiguous()
+            self.draft_miss_cluster_ids_dict[device_idx] = torch.zeros(
+                (self.batch_groups, self.max_nprobe), dtype=torch.int64, device=device_idx,
+            ).contiguous()
+            self.draft_miss_counts_dict[device_idx] = torch.zeros(
+                (self.batch_groups,), dtype=torch.int32, device=device_idx,
+            ).contiguous()
+            self.miss_centroids_dict[device_idx] = torch.zeros(
+                (self.batch_groups, self.max_nprobe, 1, self.head_dim), dtype=self.dtype, device=device_idx,
+            ).contiguous()
+            self.miss_value_sum_dict[device_idx] = torch.zeros(
+                (self.batch_groups, self.max_nprobe, 1, self.head_dim), dtype=self.dtype, device=device_idx,
+            ).contiguous()
+            self.miss_cluster_size_dict[device_idx] = torch.zeros(
+                (self.batch_groups, 1, 1, self.max_nprobe), dtype=self.dtype, device=device_idx,
+            ).contiguous()
+
             # execution buffer
             self.execution_buffer_keys_dict[device_idx] = torch.zeros(
                 (self.batch_groups, self.buffer_size*self.page_size+self.static_stride, 1, self.head_dim), 
@@ -416,47 +432,30 @@ class retroinfer_cache(KV_Cache):
                 (self.batch_groups), dtype=torch.int32, device=device_idx).contiguous()
             self.static_len_tensor_dict[device_idx] = torch.tensor(
                 self.static_pattern_total, dtype=torch.int32, device=device_idx)
-            
-            # allocate buffers used when enable CUDA graphs
-            if self.use_cuda_graph:
-                self.query_buffer_dict[device_idx] = torch.zeros(
-                    (self.batch_groups, 1, self.group_size, self.head_dim), dtype=self.dtype, device=device_idx
-                ).contiguous()
-                if self.es_cluster_num > 0:
-                    self.es_out_dict[device_idx] = torch.zeros(
-                        (self.batch_groups, 1, self.group_size, self.head_dim), dtype=self.dtype, device=device_idx
-                    ).contiguous()
-                    self.es_lse_dict[device_idx] = torch.zeros(
-                        (self.batch_groups, self.group_size, 1), dtype=torch.float32, device=device_idx
-                    ).contiguous()
-                else:
-                    self.es_out_dict[device_idx] = None
-                    self.es_lse_dict[device_idx] = None
-                self.attn_out_dict[device_idx] = torch.zeros(
-                    (self.batch_size, 1, self.num_heads, self.head_dim), dtype=self.dtype, device=device_idx
-                ).contiguous()
                 
         self.execution_stride = self.buffer_size * self.page_size + self.static_stride
 
         # point to the buffer of current layer's device
         self.cI = self.cI_dict[self.layer_mapping[str(0)]]
         self.static_len_tensor = self.static_len_tensor_dict[self.layer_mapping[str(0)]]
-        if self.use_cuda_graph:
-            self.query_buffer = self.query_buffer_dict[self.layer_mapping[str(0)]]
-            self.attn_out = self.attn_out_dict[self.layer_mapping[str(0)]]
-        else:
-            self.gemm_o = self.gemm_o_dict[self.layer_mapping[str(0)]]
-            self.softmax_o = self.softmax_o_dict[self.layer_mapping[str(0)]]
-            self.norm = self.norm_dict[self.layer_mapping[str(0)]]
-            self.sum = self.sum_dict[self.layer_mapping[str(0)]]
-            self.dist = self.dist_dict[self.layer_mapping[str(0)]]
-            self.cV = self.cV_dict[self.layer_mapping[str(0)]]
-            self.es_centroids = self.es_centroids_dict[self.layer_mapping[str(0)]]
-            self.es_value_sum = self.es_value_sum_dict[self.layer_mapping[str(0)]]
-            self.es_cluster_size = self.es_cluster_size_dict[self.layer_mapping[str(0)]]
-            self.execution_buffer_keys = self.execution_buffer_keys_dict[self.layer_mapping[str(0)]]
-            self.execution_buffer_values = self.execution_buffer_values_dict[self.layer_mapping[str(0)]]
-            self.valid_lengths = self.valid_lengths_dict[self.layer_mapping[str(0)]]
+        self.gemm_o = self.gemm_o_dict[self.layer_mapping[str(0)]]
+        self.softmax_o = self.softmax_o_dict[self.layer_mapping[str(0)]]
+        self.norm = self.norm_dict[self.layer_mapping[str(0)]]
+        self.sum = self.sum_dict[self.layer_mapping[str(0)]]
+        self.dist = self.dist_dict[self.layer_mapping[str(0)]]
+        self.cV = self.cV_dict[self.layer_mapping[str(0)]]
+        self.es_centroids = self.es_centroids_dict[self.layer_mapping[str(0)]]
+        self.es_value_sum = self.es_value_sum_dict[self.layer_mapping[str(0)]]
+        self.es_cluster_size = self.es_cluster_size_dict[self.layer_mapping[str(0)]]
+        self.draft_estimate_mask = self.draft_estimate_mask_dict[self.layer_mapping[str(0)]]
+        self.draft_miss_cluster_ids = self.draft_miss_cluster_ids_dict[self.layer_mapping[str(0)]]
+        self.draft_miss_counts = self.draft_miss_counts_dict[self.layer_mapping[str(0)]]
+        self.miss_centroids = self.miss_centroids_dict[self.layer_mapping[str(0)]]
+        self.miss_value_sum = self.miss_value_sum_dict[self.layer_mapping[str(0)]]
+        self.miss_cluster_size = self.miss_cluster_size_dict[self.layer_mapping[str(0)]]
+        self.execution_buffer_keys = self.execution_buffer_keys_dict[self.layer_mapping[str(0)]]
+        self.execution_buffer_values = self.execution_buffer_values_dict[self.layer_mapping[str(0)]]
+        self.valid_lengths = self.valid_lengths_dict[self.layer_mapping[str(0)]]
 
 
     def prepare_cache(self):
@@ -576,10 +575,7 @@ class retroinfer_cache(KV_Cache):
             self.context += seq_len
 
             if self.build_index_when_prefilling:
-                if self.use_cuda_graph:
-                    self.attn_func = self.sparse_attention_with_cudagraph
-                else:
-                    self.attn_func = self.sparse_attention
+                self.attn_func = self.verify_attention
             else:
                 self.static_pattern_total = seq_len
 
@@ -657,12 +653,18 @@ class retroinfer_cache(KV_Cache):
         torch.cuda.set_device(self.layer_mapping[str(0)])
         # switch to sparse attention, and update index will disable cudagraph
         assert not self.use_cuda_graph, "CUDA Graph does not support index updating."
-        self.attn_func = self.sparse_attention
         
         # update n_centroids, es_cluster_num
         self.n_centroids += self.UPDATE_CENTROIDS
         self.es_cluster_num += self.UPDATE_ES
         self.max_compute_cluster_num += (self.UPDATE_NPROBE + self.UPDATE_ES)
+
+        self.draft_topk_indices = [
+            [torch.zeros((self.batch_groups, self.max_compute_cluster_num), dtype=torch.int64,
+                          device=self.layer_mapping[str(ldx)])
+             for ldx in range(self.layer_num)]
+            for _ in range(self.spec_stride)
+        ]
         
         # re-allocate layer-share buffers
         for device_idx in self.device_list:
@@ -723,10 +725,6 @@ class retroinfer_cache(KV_Cache):
         value_states,       # (bsz, seq_len(=1), group_num, dim)
         layer_idx
     ):
-        # index update when generate tokens exceed UPDATE_SEGMENT
-        if self.static_pattern_total == self.static_pattern_start + self.static_pattern_end + self.UPDATE_SEGMENT:
-            self._update_kv_cache()
-
         # append newly generated token to the steady zone
         self.steady_zone_keys[layer_idx][:, :, self.static_pattern_total, :] = key_states[:, 0, :, :]
         self.steady_zone_values[layer_idx][:, :, self.static_pattern_total, :] = value_states[:, 0, :, :]
@@ -756,10 +754,44 @@ class retroinfer_cache(KV_Cache):
             )
         return attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim)
 
-    
-    def sparse_attention(self, queries, layer_idx, static_len):
+
+    def begin_draft(self):
+        # index update when generate tokens exceed UPDATE_SEGMENT
+        if self.will_update_index and self.static_pattern_total == self.static_pattern_start + self.static_pattern_end + self.UPDATE_SEGMENT:
+            self._update_kv_cache()
+        self._draft_saved_context = self.context
+        self._draft_saved_static_pattern_total = self.static_pattern_total
+        self.spec_draft_mode = True
+        self.attn_func = self.draft_attention
+        self.draft_step = 0
+
+
+    def end_draft(self):
+        self.context = self._draft_saved_context
+        self.static_pattern_total = self._draft_saved_static_pattern_total
+
+
+    def begin_verify(self):
+        self._verify_saved_context = self.context
+        self._verify_saved_static_pattern_total = self.static_pattern_total
+        self.verify_block()
+
+
+    def verify_block(self):
+        self.spec_draft_mode = False
+        self.attn_func = self.verify_attention
+        self.verify_step = 0
+
+
+    def end_verify(self):
+        self.context = self._verify_saved_context
+        self.static_pattern_total = self._verify_saved_static_pattern_total
+        self.verify_block()
+
+
+    def draft_attention(self, queries, layer_idx, static_len):
         """
-        Sparse Attention
+        Draft Attention
         Args:
             queries: query vector, shape: (batch_size, 1, head_num, dim), gpu torch tensor
             layer_idx: layer index
@@ -773,7 +805,96 @@ class retroinfer_cache(KV_Cache):
         torch.sum(self.softmax_o, dim=1, out=self.dist)  # Merge groups -> [batch_size*group_num, n_centroids]
         self.dist.masked_fill_(self.centroids_mask[layer_idx], self.DTYPE_MIN)  # mask empty clusters
         torch.topk(self.dist, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True, out=(self.cV, self.cI))
+        self.draft_topk_indices[self.draft_step][layer_idx].copy_(self.cI)
+        self.cluster_ids.copy_(self.cI[..., :self.nprobe])
+
+        if layer_idx == self.layer_num - 1:
+            self.draft_step += 1
+
+        self.wave_buffer[layer_idx].batch_access_gpu_only()
+
+        # estimation zone attention computation
+        if self.es_cluster_num > 0:
+            gather_copy_vectors(
+                self.centroids[layer_idx], self.es_centroids,
+                self.value_sum[layer_idx], self.es_value_sum,
+                self.cluster_size[layer_idx], self.es_cluster_size,
+                self.cI, self.batch_groups, self.n_centroids,
+                self.es_cluster_num, self.max_compute_cluster_num,
+                self.nprobe, self.es_cluster_num
+            )
+            es_out, es_lse = weighted_flash_decoding(
+                queries.view(self.batch_groups, 1, self.group_size, self.head_dim),
+                self.es_centroids, self.es_value_sum, self.es_cluster_size,
+                previous_out=None, previous_lse=None,
+                return_softmax_lse=True
+            )
+        else:
+            es_out, es_lse = None, None
+
+        # miss zone(estimation) attention computation
+        self.draft_estimate_mask.copy_(self.draft_estimate_masks[layer_idx], non_blocking=True)
+        estimate_mask = self.draft_estimate_mask[:, :self.nprobe].bool()
+        self.draft_miss_cluster_ids[:, :self.nprobe].copy_(torch.gather(self.cI[:, :self.nprobe], dim=1, index=torch.argsort(estimate_mask.to(torch.int32), dim=-1, descending=True,)))
+        self.draft_miss_counts.copy_(estimate_mask.sum(dim=-1, dtype=torch.int32))
+        gather_copy_vectors(
+            self.centroids[layer_idx], self.miss_centroids,
+            self.value_sum[layer_idx], self.miss_value_sum,
+            self.cluster_size[layer_idx], self.miss_cluster_size,
+            self.draft_miss_cluster_ids, self.batch_groups, self.n_centroids,
+            self.max_nprobe, self.max_nprobe,
+            0, self.nprobe
+        )
+        if torch.any(self.draft_miss_counts > 0):
+            es_out, es_lse = weighted_flash_decoding(
+                queries.view(self.batch_groups, 1, self.group_size, self.head_dim,),
+                self.miss_centroids, self.miss_value_sum, self.miss_cluster_size,
+                previous_out=es_out, previous_lse=es_lse,
+                cache_seqlens=self.draft_miss_counts,
+                return_softmax_lse=True,
+            )
+
+        # steady zone + hit zone(retrieve) attention computation
+        gather_copy_and_concat(
+            self.steady_zone_keys[layer_idx], self.list_keys[layer_idx],
+            self.cache_keys[layer_idx], self.execution_buffer_keys,
+            self.steady_zone_values[layer_idx], self.list_values[layer_idx],
+            self.cache_values[layer_idx], self.execution_buffer_values,
+            self.miss_unit_idices[layer_idx], self.miss_unit_sizes[layer_idx],
+            self.miss_unit_sizes_cumsum[layer_idx], self.miss_num_units[layer_idx],
+            self.hit_unit_idices[layer_idx], self.hit_unit_sizes[layer_idx],
+            self.hit_unit_sizes_cumsum[layer_idx], self.hit_num_units[layer_idx],
+            self.valid_lengths, self.batch_groups, self.static_stride,
+            self.list_stride, self.cache_stride, self.execution_stride,
+            self.buffer_size, self.static_len_tensor
+        )
+        attn_out = weighted_flash_decoding(
+            queries.view(self.batch_groups, 1, self.group_size, self.head_dim),
+            self.execution_buffer_keys, self.execution_buffer_values,
+            previous_out=es_out, previous_lse=es_lse,
+            cache_seqlens=self.valid_lengths,
+            return_softmax_lse=False
+        )
+        
+        return attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim)
+    
+    
+    def verify_attention(self, queries, layer_idx, static_len):
+        """
+        Verify Attention
+        Args:
+            queries: query vector, shape: (batch_size, 1, head_num, dim), gpu torch tensor
+            layer_idx: layer index
+            static_len: valid length of steady zone
+        """
+        self.static_len_tensor.fill_(static_len)
+
+        # 复用 draft 阶段计算好的 topk 聚类 ID
+        self.cI.copy_(self.draft_topk_indices[self.verify_step][layer_idx])
         self.cluster_ids.copy_(self.cI[..., :self.nprobe])  # copy the topk cluster ids to the CPU pin memory
+
+        if layer_idx == self.layer_num - 1:
+            self.verify_step += 1
 
         # estimation zone attention computation
         if self.es_cluster_num > 0:
@@ -832,129 +953,3 @@ class retroinfer_cache(KV_Cache):
         )
         
         return attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim)
-
-
-    def sparse_attention_with_cudagraph(self, queries, layer_idx, static_len):
-        """
-        Sparse Attention with CUDA graph
-        Args:
-            queries: query vector, shape: (batch_size, 1, head_num, dim), gpu torch tensor
-            layer_idx: layer index
-            static_len: valid length of steady zone
-        """
-        self.static_len_tensor.fill_(static_len)
-        self.query_buffer.copy_(queries.view(self.batch_groups, 1, self.group_size, self.head_dim), non_blocking=True)
-        
-        # get topk clusters
-        self.topk_cudagraphs[layer_idx].replay()
-        self.cluster_ids.copy_(self.cI[..., :self.nprobe])  # GPU -> CPU pin memory
-
-        # estimation zone attention computation
-        if self.es_cluster_num > 0:
-            self.es_cudagraphs[layer_idx].replay()
-        
-        # access cache and submit cache update jobs to thread pool
-        self.wave_buffer[layer_idx].batch_access()
-
-        # compute attention for retrieve zone and steady zone, merge estimation zone results
-        self.attn_cudagraphs[layer_idx].replay()
-
-        self.wave_buffer[layer_idx].sync()  # wait for update LRU finish
-        # admit pages from execution buffer to GPU cache
-        self.update_cudagraphs[layer_idx].replay()
-
-        return self.attn_out
-    
-
-    def capture_cuda_graph(self):
-        """Capture CUDA Graph"""
-        if not self.use_cuda_graph:
-            return
-        
-        print("Capture CUDA graph ...")
-        for layer_idx in range(self.layer_num):
-            with torch.cuda.device(self.layer_mapping[str(layer_idx)]):
-                capture_stream = torch.cuda.Stream(device=self.layer_mapping[str(layer_idx)])
-
-                # TopK search CUDA graph
-                torch.cuda.synchronize()
-                with torch.cuda.graph(self.topk_cudagraphs[layer_idx], stream=capture_stream):
-                    batch_gemm_softmax(
-                        self.query_buffer_dict[self.layer_mapping[str(layer_idx)]], 
-                        self.centroids[layer_idx], 
-                        self.gemm_o_dict[self.layer_mapping[str(layer_idx)]], 
-                        self.norm_dict[self.layer_mapping[str(layer_idx)]], 
-                        self.sum_dict[self.layer_mapping[str(layer_idx)]], 
-                        self.softmax_o_dict[self.layer_mapping[str(layer_idx)]],
-                        self.batch_groups, self.group_size, self.n_centroids, self.head_dim, 
-                        self.RSQRT_DIM, 0
-                    )
-                    torch.sum(self.softmax_o_dict[self.layer_mapping[str(layer_idx)]], dim=1, 
-                              out=self.dist_dict[self.layer_mapping[str(layer_idx)]])
-                    self.dist_dict[self.layer_mapping[str(layer_idx)]].masked_fill_(self.centroids_mask[layer_idx], self.DTYPE_MIN)
-                    torch.topk(self.dist_dict[self.layer_mapping[str(layer_idx)]], self.max_compute_cluster_num, 
-                               dim=-1, largest=True, sorted=True, 
-                               out=(self.cV_dict[self.layer_mapping[str(layer_idx)]], self.cI_dict[self.layer_mapping[str(layer_idx)]]))
-
-                # Estimation zone CUDA graph
-                if self.es_cluster_num > 0:
-                    torch.cuda.synchronize()
-                    with torch.cuda.graph(self.es_cudagraphs[layer_idx], stream=capture_stream):
-                        gather_copy_vectors(
-                            self.centroids[layer_idx], self.es_centroids_dict[self.layer_mapping[str(layer_idx)]], 
-                            self.value_sum[layer_idx], self.es_value_sum_dict[self.layer_mapping[str(layer_idx)]], 
-                            self.cluster_size[layer_idx], self.es_cluster_size_dict[self.layer_mapping[str(layer_idx)]],
-                            self.cI_dict[self.layer_mapping[str(layer_idx)]], 
-                            self.batch_groups, self.n_centroids, self.es_cluster_num, 
-                            self.max_compute_cluster_num, self.nprobe, self.es_cluster_num
-                        )
-                        # TODO: add output API in this kernel
-                        es_out, es_lse = weighted_flash_decoding(
-                                            self.query_buffer_dict[self.layer_mapping[str(layer_idx)]], 
-                                            self.es_centroids_dict[self.layer_mapping[str(layer_idx)]],
-                                            self.es_value_sum_dict[self.layer_mapping[str(layer_idx)]],
-                                            self.es_cluster_size_dict[self.layer_mapping[str(layer_idx)]],
-                                            previous_out=None, previous_lse=None,
-                                            return_softmax_lse=True
-                                        )
-                        self.es_out_dict[self.layer_mapping[str(layer_idx)]].copy_(es_out, non_blocking=True)
-                        self.es_lse_dict[self.layer_mapping[str(layer_idx)]].copy_(es_lse, non_blocking=True)
-
-                # Retrieval and Steady zone CUDA graph
-                torch.cuda.synchronize()
-                with torch.cuda.graph(self.attn_cudagraphs[layer_idx], stream=capture_stream):
-                    gather_copy_and_concat(
-                        self.steady_zone_keys[layer_idx], self.list_keys[layer_idx], self.cache_keys[layer_idx], 
-                        self.execution_buffer_keys_dict[self.layer_mapping[str(layer_idx)]], 
-                        self.steady_zone_values[layer_idx], self.list_values[layer_idx], self.cache_values[layer_idx], 
-                        self.execution_buffer_values_dict[self.layer_mapping[str(layer_idx)]],
-                        self.miss_unit_idices[layer_idx], self.miss_unit_sizes[layer_idx], self.miss_unit_sizes_cumsum[layer_idx], self.miss_num_units[layer_idx],
-                        self.hit_unit_idices[layer_idx], self.hit_unit_sizes[layer_idx], self.hit_unit_sizes_cumsum[layer_idx], self.hit_num_units[layer_idx],
-                        self.valid_lengths_dict[self.layer_mapping[str(layer_idx)]], self.batch_groups, self.static_stride, self.list_stride, self.cache_stride,
-                        self.execution_stride, self.buffer_size, self.static_len_tensor_dict[self.layer_mapping[str(layer_idx)]]
-                    )
-                    # TODO: add output API in this kernel
-                    attn_out = weighted_flash_decoding(
-                                    self.query_buffer_dict[self.layer_mapping[str(layer_idx)]], 
-                                    self.execution_buffer_keys_dict[self.layer_mapping[str(layer_idx)]],
-                                    self.execution_buffer_values_dict[self.layer_mapping[str(layer_idx)]],
-                                    previous_out=self.es_out_dict[self.layer_mapping[str(layer_idx)]],
-                                    previous_lse=self.es_lse_dict[self.layer_mapping[str(layer_idx)]],
-                                    cache_seqlens=self.valid_lengths_dict[self.layer_mapping[str(layer_idx)]],
-                                    return_softmax_lse=False
-                                )
-                    self.attn_out_dict[self.layer_mapping[str(layer_idx)]].copy_(attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim), non_blocking=True)
-                        
-                # Cache update CUDA graph
-                torch.cuda.synchronize()
-                with torch.cuda.graph(self.update_cudagraphs[layer_idx], stream=capture_stream):
-                    gather_copy_and_scatter(
-                        self.execution_buffer_keys_dict[self.layer_mapping[str(layer_idx)]], self.cache_keys[layer_idx], 
-                        self.execution_buffer_values_dict[self.layer_mapping[str(layer_idx)]], self.cache_values[layer_idx],
-                        self.update_buffer_indices[layer_idx], self.update_unit_sizes[layer_idx], 
-                        self.update_cache_indices[layer_idx], self.update_num_units[layer_idx], 
-                        self.batch_groups, self.execution_stride, self.cache_stride, self.buffer_size, 
-                        self.static_len_tensor_dict[self.layer_mapping[str(layer_idx)]]
-                    )
-                
-                torch.cuda.synchronize()
