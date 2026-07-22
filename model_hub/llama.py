@@ -281,6 +281,8 @@ class LlamaModel(LLM):
                     num_gpus = self.num_gpus,
                     model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)),
                 )
+            else:
+                raise ValueError("SpecDecoder currently only supports CPU-offloaded KV cache mode")
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
     

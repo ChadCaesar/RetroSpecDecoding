@@ -201,9 +201,10 @@ class LLM:
         if len(sparse_rejected_metrics) > 0:
             trigger_reasons.append("sparse_mismatch")
 
-        max_sparse_stability_ratio = max(record["stability_ratio"] for record in sparse_metric_records)
-        if max_sparse_stability_ratio >= self.sparse_stability_threshold:
-            trigger_reasons.append("stability_ratio")
+        if self.sparse_stability_threshold >= 0.0 and sparse_metric_records:
+            max_sparse_stability_ratio = max(record["stability_ratio"] for record in sparse_metric_records)
+            if max_sparse_stability_ratio >= self.sparse_stability_threshold:
+                trigger_reasons.append("stability_ratio")
 
         should_update_index = self.kv_cache.static_pattern_total >= self.kv_cache.static_pattern_start + self.kv_cache.static_pattern_end + self.kv_cache.UPDATE_SEGMENT
         if self.kv_cache.will_update_index and should_update_index:
