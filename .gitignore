@@ -403,6 +403,7 @@ benchmark/longbench/results/
 benchmark/ruler/data/synthetic/json/*.json
 benchmark/ruler/ruler_eval_result/
 benchmark/reasoning/outputs
+temp/
 
 !benchmark/reasoning/data/**/*.jsonl
 !asserts/*.png

@@ -107,7 +107,7 @@ class LLM:
         hidden_states = self.mlp(hidden_states, layer)
         hidden_states = residual + hidden_states
 
-        return hidden_states, attn_out
+        return hidden_states
 
 
     def prefill_forward(self, inputs_ids):
@@ -140,17 +140,17 @@ class LLM:
 
         if self.num_gpus > 1:
             for ldx in range(self.num_layers):
-                hidden_states, attn_out = self.layer_decode(ldx, hidden_states, decode_mode=decode_mode)
+                hidden_states = self.layer_decode(ldx, hidden_states, decode_mode=decode_mode)
                 hidden_states = self.parameter_move(hidden_states, ldx)
             hidden_states = hidden_states.to(self.layers[0].device)
         else:
             for ldx in range(self.num_layers):
-                hidden_states, attn_out = self.layer_decode(ldx, hidden_states, decode_mode=decode_mode)
+                hidden_states = self.layer_decode(ldx, hidden_states, decode_mode=decode_mode)
         
         hidden_states = self.layernorm(hidden_states, self.norm_variance_epsilon, self.norm_weight)
         logits = self.lm(hidden_states)
         
-        return logits, attn_out
+        return logits
 
 
     def sampling(self, logits, do_sample=False, temperature=0.6, top_p=0.95, top_k=20):
@@ -169,28 +169,25 @@ class LLM:
         return output_ids
 
 
-    def should_stop_draft(self, draft_count, draft_margin, draft_margin_drop):
+    def should_stop_draft(self, draft_count, draft_margin, draft_cache_hit_rate):
         if draft_count < self.min_draft_stride:
             return False, None
 
         stop_reasons = []
 
-        margin_enabled = self.draft_margin_threshold >= 0.0
-        if margin_enabled and draft_margin <= self.draft_margin_threshold:
+        if self.draft_margin_threshold >= 0.0 and draft_margin <= self.draft_margin_threshold:
             stop_reasons.append("margin")
 
-        margin_drop_enabled = self.draft_margin_drop_threshold >= 0.0
-        if margin_drop_enabled and draft_margin_drop is not None and draft_margin_drop >= self.draft_margin_drop_threshold:
-            stop_reasons.append("margin_drop")
+        if self.draft_cache_hit_rate_threshold >= 0.0 and draft_cache_hit_rate <= self.draft_cache_hit_rate_threshold:
+            stop_reasons.append("cache_hit_rate")
 
-        if len(stop_reasons) == 0:
+        if not stop_reasons:
             return False, None
         return True, "+".join(stop_reasons)
 
 
-    def should_trigger_full_verify(self, generated_len, pending_sparse_count, sparse_accepted_metrics, sparse_rejected_metrics):
+    def should_trigger_full_verify(self, generated_len, pending_sparse_count, expanded_changed):
         trigger_reasons = []
-        sparse_metric_records = sparse_accepted_metrics + sparse_rejected_metrics
 
         if pending_sparse_count >= self.max_sparse_stride:
             trigger_reasons.append("pend_limit")
@@ -198,13 +195,8 @@ class LLM:
         if generated_len + pending_sparse_count >= self.max_new_length - 1:
             trigger_reasons.append("generate_limit")
 
-        if len(sparse_rejected_metrics) > 0:
-            trigger_reasons.append("sparse_mismatch")
-
-        if self.sparse_stability_threshold >= 0.0 and sparse_metric_records:
-            max_sparse_stability_ratio = max(record["stability_ratio"] for record in sparse_metric_records)
-            if max_sparse_stability_ratio >= self.sparse_stability_threshold:
-                trigger_reasons.append("stability_ratio")
+        if expanded_changed:
+            trigger_reasons.append("sparse_expanded_mismatch")
 
         should_update_index = self.kv_cache.static_pattern_total >= self.kv_cache.static_pattern_start + self.kv_cache.static_pattern_end + self.kv_cache.UPDATE_SEGMENT
         if self.kv_cache.will_update_index and should_update_index:
@@ -216,44 +208,33 @@ class LLM:
 
 
     def draft(self, input_ids, draft_length, do_sample=False, temperature=0.6, top_p=0.95, top_k=20):
-        draft_logits_list = []
-        draft_attn_outs = []
         draft_tokens = []
         draft_token = input_ids
         draft_metrics = []
-        previous_margin = None
         stop_reason = "length_limit"
 
         self.kv_cache.begin_draft()
         try:
             for _ in range(draft_length):
-                draft_logits, draft_attn_out = self.decode_forward(inputs_ids=draft_token, decode_mode="draft")
+                draft_logits = self.decode_forward(inputs_ids=draft_token, decode_mode="draft")
                 draft_token = self.sampling(draft_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
 
-                draft_logits_list.append(draft_logits)
-                draft_attn_outs.append(draft_attn_out)
                 draft_tokens.append(draft_token)
                 print(colored(f"{draft_token.item()}", 'blue'), end="")
 
                 draft_logits_fp32 = draft_logits.detach().float().squeeze(1)
                 draft_top2 = torch.topk(draft_logits_fp32, k=2, dim=-1)
                 draft_margin = draft_top2.values[:, 0] - draft_top2.values[:, 1]
-                if previous_margin is None:
-                    draft_margin_drop = None
-                    draft_margin_drop_value = None
-                    draft_margin_drop_text = "-"
-                else:
-                    draft_margin_drop = (previous_margin - draft_margin).clamp_min(0.0) / previous_margin.abs().clamp_min(1e-6)
-                    draft_margin_drop_value = draft_margin_drop.mean().item()
-                    draft_margin_drop_text = round(draft_margin_drop_value, 4)
+
+                draft_cache_hit_rate = torch.stack(self.kv_cache.draft_cache_hit_rates).mean().item()
+
                 draft_metrics.append({
                     "draft_margin": draft_margin.mean().item(),
-                    "draft_margin_drop": draft_margin_drop_value
+                    "draft_cache_hit_rate": draft_cache_hit_rate
                 })
-                previous_margin = draft_margin.detach()
-                print(colored(f"({round(draft_margin.mean().item(), 4)}, {draft_margin_drop_text})", "cyan"), end=" ")
+                print(colored(f"({round(draft_margin.mean().item(), 4)}, {round(draft_cache_hit_rate, 4)})", "cyan"), end=" ")
 
-                should_stop, metric_stop_reason = self.should_stop_draft(len(draft_tokens), draft_margin.mean().item(), draft_margin_drop_value)
+                should_stop, metric_stop_reason = self.should_stop_draft(len(draft_tokens), draft_margin.mean().item(), draft_cache_hit_rate)
                 if should_stop:
                     stop_reason = metric_stop_reason
                     break
@@ -261,30 +242,7 @@ class LLM:
             self.kv_cache.end_draft()
 
         print(colored(f"Draft stopped by {stop_reason}", "green" if stop_reason == "length_limit" else "red"))
-        return draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics
-
-
-    def compute_stability_ratio(self, draft_logits, verify_logits):
-        # Draft/Verify logits，形状由 [batch, 1, vocab] 转为 [batch, vocab]
-        draft_logits_fp32 = draft_logits.float().squeeze(1)
-        verify_logits_fp32 = verify_logits.detach().float().squeeze(1)
-
-        # Verify top-1/top-2 margin
-        verify_top2 = torch.topk(verify_logits_fp32, k=2, dim=-1)
-        verify_top1_id = verify_top2.indices[:, 0:1]
-        verify_margin = (verify_top2.values[:, 0] - verify_top2.values[:, 1])
-
-        # 计算 Draft 相对于 Verify 决策边界的最大扰动
-        draft_value_at_verify_top1 = draft_logits_fp32.gather(dim=-1, index=verify_top1_id)
-        verify_top1_value = verify_logits_fp32.gather(dim=-1, index=verify_top1_id)
-
-        draft_gaps = draft_value_at_verify_top1 - draft_logits_fp32
-        verify_gaps = verify_top1_value - verify_logits_fp32
-
-        gap_linf = (draft_gaps - verify_gaps).abs().amax(dim=-1)
-
-        stability_ratio = (gap_linf / verify_margin.clamp_min(1e-12))
-        return gap_linf, verify_margin, stability_ratio
+        return draft_tokens, draft_metrics
 
 
     def print_metric_summary(self, group_name, records):
@@ -292,9 +250,9 @@ class LLM:
             print(f"\n{group_name}: no samples")
             return
 
-        metric_names = ["attention_mean", "gap_linf", "verify_margin", "stability_ratio", "draft_margin", "draft_margin_drop"]
-
         print(f"\n{group_name}: count={len(records)}")
+
+        metric_names = ["draft_margin", "draft_cache_hit_rate", "sparse_margin", "expanded_retry", "expanded_changed"]
 
         for metric_name in metric_names:
             raw_values = [
@@ -321,57 +279,93 @@ class LLM:
                 f"max={values.max().item():.4f}"
             )
 
-        ratio_values = torch.tensor([record["stability_ratio"] for record in records], dtype=torch.float64)
-        ratio_below_one = (ratio_values < 1.0).double().mean().item() * 100.0
 
-        print(
-            f"  stability_ratio < 1: "
-            f"{ratio_below_one:.2f}%"
-        )
-
-
-    def verify(self, input_ids, draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics, decode_mode, do_sample=False, temperature=0.6, top_p=0.95, top_k=20):
-        verify_logits_list = []
-        verify_attn_outs = []
-        verify_tokens = []
+    def sparse_verify(self, input_ids, draft_tokens, draft_metrics, do_sample=False, temperature=0.6, top_p=0.95, top_k=20):
+        sparse_tokens = []
         accepted_metrics = []
         rejected_metrics = []
-        verify_token = input_ids
+        sparse_token = input_ids
+        expanded_changed = False
 
         for i in range(len(draft_tokens)):
-            verify_logits, verify_attn_out = self.decode_forward(inputs_ids=verify_token, decode_mode=decode_mode)
-            verify_token = self.sampling(verify_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+            sparse_input_token = sparse_token
+            token_checkpoint = self.kv_cache.checkpoint_verify_token()
 
-            verify_logits_list.append(verify_logits)
-            verify_attn_outs.append(verify_attn_out)
-            verify_tokens.append(verify_token)
-            print(colored(f"{verify_token.item()}", 'yellow'), end="")
+            sparse_logits = self.decode_forward(inputs_ids=sparse_token, decode_mode="sparse_verify")
+            sparse_token = self.sampling(sparse_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
 
-            accept = torch.equal(verify_token, draft_tokens[i])
+            accept = torch.equal(sparse_token, draft_tokens[i])
 
-            draft_logits = draft_logits_list[i]
-            draft_attn_out = draft_attn_outs[i]
-            attn_sim = torch.cosine_similarity(draft_attn_out.float(), verify_attn_out.float(), dim=-1)
-            gap_linf, verify_margin, stability_ratio = self.compute_stability_ratio(draft_logits, verify_logits)
-            print(colored(f"({round(attn_sim.mean().item(), 4)}, {round(gap_linf.mean().item(), 4)}, {round(verify_margin.mean().item(), 4)}, {round(stability_ratio.mean().item(), 4)})",
-                          'green' if accept else 'red'), end=" ")
+            sparse_logits_fp32 = sparse_logits.detach().float().squeeze(1)
+            sparse_top2 = torch.topk(sparse_logits_fp32, k=2, dim=-1)
+            sparse_margin = (sparse_top2.values[:, 0] - sparse_top2.values[:, 1]).mean().item()
+
+            print(colored(f"{sparse_token.item()}", 'yellow'), end="")
+            print(colored(f"({round(sparse_margin, 4)})", 'green' if accept else 'red'), end=" ")
+
+            margin_retry = self.sparse_margin_threshold >= 0.0 and sparse_margin <= self.sparse_margin_threshold
+            expanded_retry = not accept or margin_retry
+
+            if expanded_retry:
+                self.kv_cache.restore_verify_token(token_checkpoint)
+                self.kv_cache.expanded_verify_mode = True
+                try:
+                    expanded_logits = self.decode_forward(inputs_ids=sparse_input_token,decode_mode="sparse_verify")
+                    expanded_token = self.sampling(expanded_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                finally:
+                    self.kv_cache.expanded_verify_mode = False
+
+                expanded_changed = not torch.equal(expanded_token, sparse_token)
+
+                # pending sparse 路径使用 expanded 结果
+                sparse_token = expanded_token
+
             metric_record = {
-                "attention_mean": attn_sim.mean().item(),
-                "gap_linf": gap_linf.mean().item(),
-                "verify_margin": verify_margin.mean().item(),
-                "stability_ratio": stability_ratio.mean().item(),
                 "draft_margin": draft_metrics[i]["draft_margin"],
-                "draft_margin_drop": draft_metrics[i]["draft_margin_drop"]
+                "draft_cache_hit_rate": draft_metrics[i]["draft_cache_hit_rate"],
+                "sparse_margin": sparse_margin,
+                "expanded_retry": expanded_retry,
+                "expanded_changed": expanded_changed
             }
 
+            sparse_tokens.append(sparse_token)
             if accept:
                 accepted_metrics.append(metric_record)
             else:
                 rejected_metrics.append(metric_record)
+
+            if expanded_changed or not accept:
+                print(colored(f"{sparse_token.item()}", 'red' if expanded_changed else 'green'), end="")
                 break
 
         print()
-        return verify_logits_list, verify_attn_outs, verify_tokens, accepted_metrics, rejected_metrics
+        return sparse_tokens, accepted_metrics, rejected_metrics, expanded_changed
+
+
+    def full_verify(self, input_ids, sparse_tokens, do_sample=False, temperature=0.6, top_p=0.95, top_k=20):
+        full_tokens = []
+        accept_count = 0
+        reject_count = 0
+        full_token = input_ids
+
+        for sparse_token in sparse_tokens:
+            full_logits = self.decode_forward(inputs_ids=full_token, decode_mode="full_verify")
+            full_token = self.sampling(full_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+
+            accept = torch.equal(full_token, sparse_token)
+            full_tokens.append(full_token)
+            if accept:
+                accept_count += 1
+            else:
+                reject_count += 1
+
+            print(colored(f"{full_token.item()}", 'green' if accept else 'red'), end=" ")
+
+            if not accept:
+                break
+
+        print()
+        return full_tokens, accept_count, reject_count
 
 
     def inference(self, inputs_ids, do_sample=False, temperature=0.6, top_p=0.95, top_k=20, ignore_eos=True):
@@ -409,7 +403,7 @@ class LLM:
 
         if self.attention_type in ['Full_Flash_Attn', 'RetroInfer']:
             for _ in range(self.max_new_length-1):
-                logits, attn_out = self.decode_forward(inputs_ids=output_ids)
+                logits = self.decode_forward(inputs_ids=output_ids)
                 output_ids = self.sampling(logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                 if not ignore_eos:
                     end_of_text |= (output_ids == eos_token)
@@ -427,12 +421,8 @@ class LLM:
             step_num = 0
             sparse_accepted_metrics_list = []
             sparse_rejected_metrics_list = []
-            pending_sparse_logits_list = []
-            pending_sparse_attn_outs = []
             pending_sparse_tokens = []
-            pending_sparse_draft_metrics = []
-            full_accepted_metrics_list = []
-            full_rejected_metrics_list = []
+            full_trigger_reason_counts = {}
 
             while generated_len < self.max_new_length-1:
                 # Draft 阶段
@@ -445,7 +435,7 @@ class LLM:
                 if actual_stride <= 0:
                     break
                 draft_input_ids = pending_sparse_tokens[-1] if len(pending_sparse_tokens) > 0 else output_ids
-                draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics = self.draft(draft_input_ids, actual_stride, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                draft_tokens, draft_metrics = self.draft(draft_input_ids, actual_stride, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                 draft_num += len(draft_tokens)
 
                 # Sparse Verify 阶段
@@ -454,17 +444,14 @@ class LLM:
                     self.kv_cache.begin_verify()
                 else:
                     self.kv_cache.verify_block()
-                sparse_logits_list, sparse_attn_outs, sparse_tokens, sparse_accepted_metrics, sparse_rejected_metrics = self.verify(draft_input_ids, draft_logits_list, draft_attn_outs, draft_tokens, draft_metrics, "sparse_verify", do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                sparse_tokens, sparse_accepted_metrics, sparse_rejected_metrics, expanded_changed = self.sparse_verify(draft_input_ids, draft_tokens, draft_metrics, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                 sparse_accept_num += len(sparse_accepted_metrics)
                 sparse_reject_num += len(sparse_rejected_metrics)
                 sparse_accepted_metrics_list.extend(sparse_accepted_metrics)
                 sparse_rejected_metrics_list.extend(sparse_rejected_metrics)
-                pending_sparse_logits_list.extend(sparse_logits_list)
-                pending_sparse_attn_outs.extend(sparse_attn_outs)
                 pending_sparse_tokens.extend(sparse_tokens)
-                pending_sparse_draft_metrics.extend(draft_metrics[:len(sparse_tokens)])
 
-                full_trigger, full_trigger_reasons = self.should_trigger_full_verify(generated_len, len(pending_sparse_tokens), sparse_accepted_metrics, sparse_rejected_metrics)
+                full_trigger, full_trigger_reasons = self.should_trigger_full_verify(generated_len, len(pending_sparse_tokens), expanded_changed)
                 if not full_trigger:
                     print(colored("Full verify deferred", 'green'))
                     continue
@@ -473,15 +460,12 @@ class LLM:
 
                 # Full Verify 阶段
                 print(colored(f"Full verify by {full_trigger_reasons}: ", 'yellow'), end="")
-                full_logits_list, full_attn_outs, full_tokens, full_accepted_metrics, full_rejected_metrics = self.verify(output_ids, pending_sparse_logits_list, pending_sparse_attn_outs, pending_sparse_tokens, pending_sparse_draft_metrics, "full_verify", do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
-                full_accept_num += len(full_accepted_metrics)
-                full_reject_num += len(full_rejected_metrics)
-                pending_sparse_logits_list.clear()
-                pending_sparse_attn_outs.clear()
+                for reason in full_trigger_reasons.split("+"):
+                    full_trigger_reason_counts[reason] = full_trigger_reason_counts.get(reason, 0) + 1
+                full_tokens, current_full_accept_num, current_full_reject_num = self.full_verify(output_ids, pending_sparse_tokens, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                full_accept_num += current_full_accept_num
+                full_reject_num += current_full_reject_num
                 pending_sparse_tokens.clear()
-                pending_sparse_draft_metrics.clear()
-                full_accepted_metrics_list.extend(full_accepted_metrics)
-                full_rejected_metrics_list.extend(full_rejected_metrics)
 
                 for full_token in full_tokens:
                     outputs_ids.append(full_token)
@@ -506,13 +490,12 @@ class LLM:
                     f"Full accept tokens: {full_accept_num}, "
                     f"Full reject tokens: {full_reject_num}, "
                     f"Generate steps: {step_num}",
-                    "green",
+                    "green"
                 )
             )
+            print("Full verify trigger counts: " f"{full_trigger_reason_counts}")
             self.print_metric_summary("Draft vs Sparse - Accepted group", sparse_accepted_metrics_list)
             self.print_metric_summary("Draft vs Sparse - Rejected group", sparse_rejected_metrics_list)
-            self.print_metric_summary("Sparse vs Full - Accepted group", full_accepted_metrics_list)
-            self.print_metric_summary("Sparse vs Full - Rejected group", full_rejected_metrics_list)
 
         torch.cuda.synchronize()
         decode_end = time.time()
@@ -558,9 +541,9 @@ class LLM:
             self.min_draft_stride = spec_config["min_draft_stride"]
             self.max_draft_stride = spec_config["max_draft_stride"]
             self.draft_margin_threshold = spec_config["draft_margin_threshold"]
-            self.draft_margin_drop_threshold = spec_config["draft_margin_drop_threshold"]
+            self.draft_cache_hit_rate_threshold = spec_config["draft_cache_hit_rate_threshold"]
             self.max_sparse_stride = spec_config["max_sparse_stride"]
-            self.sparse_stability_threshold = spec_config["sparse_stability_threshold"]
+            self.sparse_margin_threshold = spec_config["sparse_margin_threshold"]
             if not 1 <= self.min_draft_stride <= self.max_draft_stride:
                 raise ValueError(f"min_draft_stride should be in [1, max_draft_stride] but got min_draft_stride={self.min_draft_stride} and max_draft_stride={self.max_draft_stride}")
 

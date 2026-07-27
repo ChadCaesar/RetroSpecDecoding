@@ -126,8 +126,11 @@ class specdecoder_cache(KV_Cache):
         # estimation zone size (count by clusters)
         self.es_cluster_num = min(round(self.n_centroids*estimation_budget), self.n_centroids-self.nprobe)
         self.max_nprobe = self.nprobe + self.nprobe_new
+        self.max_search_nprobe = min(2 * (self.nprobe + self.nprobe_new), self.n_centroids + self.n_centroids_new)
         # retrieve zone + estimation zone size
         self.max_compute_cluster_num = self.es_cluster_num + self.nprobe
+        self._refresh_expanded_search_size()
+        self.expanded_verify_mode = False
         assert self.max_compute_cluster_num <= self.n_centroids, \
             f"max_compute_cluster_num({self.max_compute_cluster_num}) should <= n_centroids({self.n_centroids})"
         print(f"Initial n_centroids: {self.n_centroids}, nprobe: {self.nprobe}, es_cluster_num: {self.es_cluster_num}")
@@ -144,6 +147,7 @@ class specdecoder_cache(KV_Cache):
              for ldx in range(self.layer_num)]
             for _ in range(self.spec_stride)
         ]
+        self.draft_cache_hit_rates = []
 
         # calculate the GPU block cache size and compute buffer size (count by pages)
         cache_cluster_num = round((self.n_centroids + self.n_centroids_new) * cache_ratio) if cache_ratio > 0.0 \
@@ -160,7 +164,7 @@ class specdecoder_cache(KV_Cache):
         thread_pool_pointer = self.thread_pool.get()
         # initialize the Wave Buffer
         self.wave_buffer = [WaveBufferCPU(
-            self.batch_size, self.kv_head, self.head_dim, self.nprobe, self.nprobe_new, self.page_size, 
+            self.batch_size, self.kv_head, self.head_dim, self.nprobe, self.max_search_nprobe, self.page_size,
             self.n_centroids+self.n_centroids_new, self.buffer_size, self.cache_size, core, thread_pool_pointer)
             for _ in range(self.layer_num)
         ]
@@ -223,6 +227,7 @@ class specdecoder_cache(KV_Cache):
         ]
         # store searched TopK cluster IDs
         self.cluster_ids = torch.empty((self.batch_groups, self.nprobe), dtype=torch.int64, pin_memory=True).contiguous()
+        self.expanded_cluster_ids = torch.empty((self.batch_groups, self.expanded_nprobe), dtype=torch.int64, pin_memory=True).contiguous()
 
         for ldx in range(self.layer_num):
             self.wave_buffer[ldx].set_indices(
@@ -338,7 +343,22 @@ class specdecoder_cache(KV_Cache):
         
         # set decoding attention function
         self.attn_func = self.dense_attention
-    
+
+
+    def _refresh_expanded_search_size(self):
+        if self.nprobe == 0:
+            self.expanded_nprobe = 0
+            self.expanded_es_cluster_num = 0
+            return
+
+        requested_nprobe = 2 * self.nprobe
+
+        if requested_nprobe > self.max_compute_cluster_num:
+            raise ValueError(f"Cannot double sparse exact zone: 2 * nprobe ({requested_nprobe}) exceeds max_compute_cluster_num ({self.max_compute_cluster_num})")
+
+        self.expanded_nprobe = requested_nprobe
+        self.expanded_es_cluster_num = self.max_compute_cluster_num - self.expanded_nprobe
+
 
     def pre_allocate_decision(self):
         """Decide whether to pre-allocate GPU cache and buffers before prefilling"""
@@ -658,6 +678,8 @@ class specdecoder_cache(KV_Cache):
         self.n_centroids += self.UPDATE_CENTROIDS
         self.es_cluster_num += self.UPDATE_ES
         self.max_compute_cluster_num += (self.UPDATE_NPROBE + self.UPDATE_ES)
+        self._refresh_expanded_search_size()
+        self.expanded_cluster_ids = torch.empty((self.batch_groups, self.expanded_nprobe), dtype=torch.int64, pin_memory=True).contiguous()
 
         self.draft_topk_indices = [
             [torch.zeros((self.batch_groups, self.max_compute_cluster_num), dtype=torch.int64,
@@ -764,6 +786,7 @@ class specdecoder_cache(KV_Cache):
         self.spec_draft_mode = True
         self.attn_func = self.draft_attention
         self.draft_step = 0
+        self.draft_cache_hit_rates = []
 
 
     def end_draft(self):
@@ -779,6 +802,7 @@ class specdecoder_cache(KV_Cache):
 
     def verify_block(self):
         self.spec_draft_mode = False
+        self.expanded_verify_mode = False
         self.attn_func = self.verify_attention
         self.verify_step = 0
 
@@ -787,6 +811,22 @@ class specdecoder_cache(KV_Cache):
         self.context = self._verify_saved_context
         self.static_pattern_total = self._verify_saved_static_pattern_total
         self.verify_block()
+
+
+    def checkpoint_verify_token(self):
+        return (
+            self.context,
+            self.static_pattern_total,
+            self.verify_step,
+        )
+
+
+    def restore_verify_token(self, checkpoint):
+        (
+            self.context,
+            self.static_pattern_total,
+            self.verify_step,
+        ) = checkpoint
 
 
     def draft_attention(self, queries, layer_idx, static_len):
@@ -807,6 +847,7 @@ class specdecoder_cache(KV_Cache):
         torch.topk(self.dist, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True, out=(self.cV, self.cI))
         self.draft_topk_indices[self.draft_step][layer_idx].copy_(self.cI)
         self.cluster_ids.copy_(self.cI[..., :self.nprobe])
+        self.wave_buffer[layer_idx].set_searched_clusters(self.cluster_ids)
 
         if layer_idx == self.layer_num - 1:
             self.draft_step += 1
@@ -837,6 +878,9 @@ class specdecoder_cache(KV_Cache):
         estimate_mask = self.draft_estimate_mask[:, :self.nprobe].bool()
         self.draft_miss_cluster_ids[:, :self.nprobe].copy_(torch.gather(self.cI[:, :self.nprobe], dim=1, index=torch.argsort(estimate_mask.to(torch.int32), dim=-1, descending=True,)))
         self.draft_miss_counts.copy_(estimate_mask.sum(dim=-1, dtype=torch.int32))
+        if layer_idx == 0:
+            self.draft_cache_hit_rates.clear()
+        self.draft_cache_hit_rates.append((1.0 - estimate_mask.float().mean()).detach().cpu())
         gather_copy_vectors(
             self.centroids[layer_idx], self.miss_centroids,
             self.value_sum[layer_idx], self.miss_value_sum,
@@ -889,28 +933,38 @@ class specdecoder_cache(KV_Cache):
         """
         self.static_len_tensor.fill_(static_len)
 
+        if self.expanded_verify_mode:
+            active_nprobe = self.expanded_nprobe
+            active_cluster_ids = self.expanded_cluster_ids
+            active_es_cluster_num = self.expanded_es_cluster_num
+        else:
+            active_nprobe = self.nprobe
+            active_cluster_ids = self.cluster_ids
+            active_es_cluster_num = self.es_cluster_num
+
         # 复用 draft 阶段计算好的 topk 聚类 ID
         self.cI.copy_(self.draft_topk_indices[self.verify_step][layer_idx])
-        self.cluster_ids.copy_(self.cI[..., :self.nprobe])  # copy the topk cluster ids to the CPU pin memory
+        active_cluster_ids.copy_(self.cI[..., :active_nprobe])  # copy the topk cluster ids to the CPU pin memory
+        self.wave_buffer[layer_idx].set_searched_clusters(active_cluster_ids)
 
         if layer_idx == self.layer_num - 1:
             self.verify_step += 1
 
         # estimation zone attention computation
-        if self.es_cluster_num > 0:
+        if active_es_cluster_num  > 0:
             gather_copy_vectors(
                 self.centroids[layer_idx], self.es_centroids, 
                 self.value_sum[layer_idx], self.es_value_sum, 
                 self.cluster_size[layer_idx], self.es_cluster_size,
                 self.cI, self.batch_groups, self.n_centroids, self.es_cluster_num, 
-                self.max_compute_cluster_num, self.nprobe, self.es_cluster_num
+                self.max_compute_cluster_num, active_nprobe, active_es_cluster_num
             )
             
             es_out, es_lse = weighted_flash_decoding(
                                 queries.view(self.batch_groups, 1, self.group_size, self.head_dim), 
-                                self.es_centroids,       # [batch_size*group_num, es_cluster_num, 1, dim]
-                                self.es_value_sum,       # [batch_size*group_num, es_cluster_num, 1, dim]
-                                self.es_cluster_size,    # [batch_size*group_num, 1, 1, es_cluster_num]
+                                self.es_centroids[:, :active_es_cluster_num].contiguous(),
+                                self.es_value_sum[:, :active_es_cluster_num].contiguous(),
+                                self.es_cluster_size[..., :active_es_cluster_num].contiguous(),
                                 previous_out=None, previous_lse=None,
                                 return_softmax_lse=True
                             )
