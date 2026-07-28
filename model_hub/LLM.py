@@ -169,7 +169,7 @@ class LLM:
         return output_ids
 
 
-    def should_stop_draft(self, draft_count, draft_margin, draft_cache_hit_rate):
+    def should_stop_draft(self, draft_count, draft_margin):
         if draft_count < self.min_draft_stride:
             return False, None
 
@@ -177,9 +177,6 @@ class LLM:
 
         if self.draft_margin_threshold >= 0.0 and draft_margin <= self.draft_margin_threshold:
             stop_reasons.append("margin")
-
-        if self.draft_cache_hit_rate_threshold >= 0.0 and draft_cache_hit_rate <= self.draft_cache_hit_rate_threshold:
-            stop_reasons.append("cache_hit_rate")
 
         if not stop_reasons:
             return False, None
@@ -226,15 +223,24 @@ class LLM:
                 draft_top2 = torch.topk(draft_logits_fp32, k=2, dim=-1)
                 draft_margin = draft_top2.values[:, 0] - draft_top2.values[:, 1]
 
-                draft_cache_hit_rate = torch.stack(self.kv_cache.draft_cache_hit_rates).mean().item()
+                draft_metric = {"draft_margin": draft_margin.mean().item()}
+                ratio_sources = {
+                    "draft_hit_attention_ratio": self.kv_cache.draft_hit_attention_ratios,
+                    "draft_retrieval_attention_ratio": self.kv_cache.draft_retrieval_attention_ratios,
+                    "draft_compute_attention_ratio": self.kv_cache.draft_compute_attention_ratios
+                }
+                for metric_name, layer_values in ratio_sources.items():
+                    values = torch.stack(layer_values).float()
+                    draft_metric.update({
+                        f"{metric_name}_mean": values.mean().item(),
+                        f"{metric_name}_min": values.min().item(),
+                        f"{metric_name}_q25": torch.quantile(values, 0.25).item(),
+                        f"{metric_name}_std": values.std(unbiased=False).item()
+                    })
+                draft_metrics.append(draft_metric)
+                print(colored(f"({round(draft_metric['draft_margin'], 4)}, {round(draft_metric['draft_hit_attention_ratio_mean'], 4)}, {round(draft_metric['draft_retrieval_attention_ratio_mean'], 4)}, {round(draft_metric['draft_compute_attention_ratio_mean'], 4)})", "cyan"), end=" ")
 
-                draft_metrics.append({
-                    "draft_margin": draft_margin.mean().item(),
-                    "draft_cache_hit_rate": draft_cache_hit_rate
-                })
-                print(colored(f"({round(draft_margin.mean().item(), 4)}, {round(draft_cache_hit_rate, 4)})", "cyan"), end=" ")
-
-                should_stop, metric_stop_reason = self.should_stop_draft(len(draft_tokens), draft_margin.mean().item(), draft_cache_hit_rate)
+                should_stop, metric_stop_reason = self.should_stop_draft(len(draft_tokens), draft_margin.mean().item())
                 if should_stop:
                     stop_reason = metric_stop_reason
                     break
@@ -252,7 +258,11 @@ class LLM:
 
         print(f"\n{group_name}: count={len(records)}")
 
-        metric_names = ["draft_margin", "draft_cache_hit_rate", "sparse_margin", "expanded_retry", "expanded_changed"]
+        metric_names = ["draft_margin", "sparse_margin", "expanded_retry", "expanded_changed"]
+        ratio_names = ["draft_hit_attention_ratio", "draft_retrieval_attention_ratio", "draft_compute_attention_ratio"]
+        ratio_statistics = ["_mean", "_min", "_q25", "_std"]
+        for ratio_name in ratio_names:
+            metric_names.extend(ratio_name + suffix for suffix in ratio_statistics)
 
         for metric_name in metric_names:
             raw_values = [
@@ -321,8 +331,7 @@ class LLM:
                 sparse_token = expanded_token
 
             metric_record = {
-                "draft_margin": draft_metrics[i]["draft_margin"],
-                "draft_cache_hit_rate": draft_metrics[i]["draft_cache_hit_rate"],
+                **draft_metrics[i],
                 "sparse_margin": sparse_margin,
                 "expanded_retry": expanded_retry,
                 "expanded_changed": expanded_changed
@@ -541,7 +550,6 @@ class LLM:
             self.min_draft_stride = spec_config["min_draft_stride"]
             self.max_draft_stride = spec_config["max_draft_stride"]
             self.draft_margin_threshold = spec_config["draft_margin_threshold"]
-            self.draft_cache_hit_rate_threshold = spec_config["draft_cache_hit_rate_threshold"]
             self.max_sparse_stride = spec_config["max_sparse_stride"]
             self.sparse_margin_threshold = spec_config["sparse_margin_threshold"]
             if not 1 <= self.min_draft_stride <= self.max_draft_stride:

@@ -147,7 +147,9 @@ class specdecoder_cache(KV_Cache):
              for ldx in range(self.layer_num)]
             for _ in range(self.spec_stride)
         ]
-        self.draft_cache_hit_rates = []
+        self.draft_hit_attention_ratios = []
+        self.draft_retrieval_attention_ratios = []
+        self.draft_compute_attention_ratios = []
 
         # calculate the GPU block cache size and compute buffer size (count by pages)
         cache_cluster_num = round((self.n_centroids + self.n_centroids_new) * cache_ratio) if cache_ratio > 0.0 \
@@ -786,7 +788,9 @@ class specdecoder_cache(KV_Cache):
         self.spec_draft_mode = True
         self.attn_func = self.draft_attention
         self.draft_step = 0
-        self.draft_cache_hit_rates = []
+        self.draft_hit_attention_ratios.clear()
+        self.draft_retrieval_attention_ratios.clear()
+        self.draft_compute_attention_ratios.clear()
 
 
     def end_draft(self):
@@ -878,9 +882,6 @@ class specdecoder_cache(KV_Cache):
         estimate_mask = self.draft_estimate_mask[:, :self.nprobe].bool()
         self.draft_miss_cluster_ids[:, :self.nprobe].copy_(torch.gather(self.cI[:, :self.nprobe], dim=1, index=torch.argsort(estimate_mask.to(torch.int32), dim=-1, descending=True,)))
         self.draft_miss_counts.copy_(estimate_mask.sum(dim=-1, dtype=torch.int32))
-        if layer_idx == 0:
-            self.draft_cache_hit_rates.clear()
-        self.draft_cache_hit_rates.append((1.0 - estimate_mask.float().mean()).detach().cpu())
         gather_copy_vectors(
             self.centroids[layer_idx], self.miss_centroids,
             self.value_sum[layer_idx], self.miss_value_sum,
@@ -919,6 +920,17 @@ class specdecoder_cache(KV_Cache):
             cache_seqlens=self.valid_lengths,
             return_softmax_lse=False
         )
+
+        hit_attention_ratio = self.cV[:, :self.nprobe].float().masked_fill(estimate_mask, 0.0).sum(dim=-1) / self.group_size
+        retrieval_attention_ratio = self.cV[:, :self.nprobe].float().sum(dim=-1) / self.group_size
+        compute_attention_ratio = self.cV.float().sum(dim=-1) / self.group_size
+        if layer_idx == 0:
+            self.draft_hit_attention_ratios.clear()
+            self.draft_retrieval_attention_ratios.clear()
+            self.draft_compute_attention_ratios.clear()
+        self.draft_hit_attention_ratios.append(hit_attention_ratio.mean().detach().cpu())
+        self.draft_retrieval_attention_ratios.append(retrieval_attention_ratio.mean().detach().cpu())
+        self.draft_compute_attention_ratios.append(compute_attention_ratio.mean().detach().cpu())
         
         return attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim)
     
