@@ -404,6 +404,7 @@ benchmark/ruler/data/synthetic/json/*.json
 benchmark/ruler/ruler_eval_result/
 benchmark/reasoning/outputs
 temp/
+docs/
 
 !benchmark/reasoning/data/**/*.jsonl
 !asserts/*.png

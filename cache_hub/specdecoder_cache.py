@@ -147,9 +147,9 @@ class specdecoder_cache(KV_Cache):
              for ldx in range(self.layer_num)]
             for _ in range(self.spec_stride)
         ]
-        self.draft_hit_attention_ratios = []
-        self.draft_retrieval_attention_ratios = []
-        self.draft_compute_attention_ratios = []
+        self.hit_attention_ratios = []
+        self.retrieval_attention_ratios = []
+        self.expanded_attention_ratios = []
 
         # calculate the GPU block cache size and compute buffer size (count by pages)
         cache_cluster_num = round((self.n_centroids + self.n_centroids_new) * cache_ratio) if cache_ratio > 0.0 \
@@ -788,9 +788,9 @@ class specdecoder_cache(KV_Cache):
         self.spec_draft_mode = True
         self.attn_func = self.draft_attention
         self.draft_step = 0
-        self.draft_hit_attention_ratios.clear()
-        self.draft_retrieval_attention_ratios.clear()
-        self.draft_compute_attention_ratios.clear()
+        self.hit_attention_ratios.clear()
+        self.retrieval_attention_ratios.clear()
+        self.expanded_attention_ratios.clear()
 
 
     def end_draft(self):
@@ -923,14 +923,14 @@ class specdecoder_cache(KV_Cache):
 
         hit_attention_ratio = self.cV[:, :self.nprobe].float().masked_fill(estimate_mask, 0.0).sum(dim=-1) / self.group_size
         retrieval_attention_ratio = self.cV[:, :self.nprobe].float().sum(dim=-1) / self.group_size
-        compute_attention_ratio = self.cV.float().sum(dim=-1) / self.group_size
+        expanded_attention_ratio = self.cV[:, :self.expanded_nprobe].float().sum(dim=-1) / self.group_size
         if layer_idx == 0:
-            self.draft_hit_attention_ratios.clear()
-            self.draft_retrieval_attention_ratios.clear()
-            self.draft_compute_attention_ratios.clear()
-        self.draft_hit_attention_ratios.append(hit_attention_ratio.mean().detach().cpu())
-        self.draft_retrieval_attention_ratios.append(retrieval_attention_ratio.mean().detach().cpu())
-        self.draft_compute_attention_ratios.append(compute_attention_ratio.mean().detach().cpu())
+            self.hit_attention_ratios.clear()
+            self.retrieval_attention_ratios.clear()
+            self.expanded_attention_ratios.clear()
+        self.hit_attention_ratios.append(hit_attention_ratio.mean().detach().cpu())
+        self.retrieval_attention_ratios.append(retrieval_attention_ratio.mean().detach().cpu())
+        self.expanded_attention_ratios.append(expanded_attention_ratio.mean().detach().cpu())
         
         return attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim)
     

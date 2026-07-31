@@ -17,9 +17,13 @@ def add_config_args(parser):
 def add_spec_args(parser):
     parser.add_argument("--min_draft_stride", type=int, default=1, help="Min number of draft tokens per speculative step")
     parser.add_argument("--max_draft_stride", type=int, default=16, help="Max number of draft tokens per speculative step")
-    parser.add_argument("--draft_margin_threshold", type=float, default=0.25, help="Stop draft when margin is below this value")
+    parser.add_argument("--draft_margin_threshold", type=float, default=0.2, help="Stop draft when margin is below this value")
+    parser.add_argument("--draft_hit_attn_threshold", type=float, default=0.2, help="Stop draft when hit attention ratio is below this value")
     parser.add_argument("--max_sparse_stride", type=int, default=64, help="Max number of sparse-verify tokens pending full-verify")
-    parser.add_argument("--sparse_margin_threshold", type=float, default=-1.0, help="Trigger full verify when sparse margin is below this value")
+    parser.add_argument("--sparse_margin_threshold", type=float, default=0.2, help="Trigger expanded verify when sparse margin is below this value")
+    parser.add_argument("--sparse_retrieval_attn_threshold", type=float, default=0.4, help="Trigger expanded verify when retrieval attention ratio is below this value")
+    parser.add_argument("--expanded_margin_threshold", type=float, default=0.2, help="Trigger full verify when expanded margin is below this value")
+    parser.add_argument("--expanded_attn_threshold", type=float, default=0.5, help="Trigger full verify when expanded attention ratio is below this value")
     return parser
 
 
@@ -45,8 +49,9 @@ def generate_config(
     model_name, context_len, attn_type, 
     retrieval_budget=0.018, estimation_budget=0.232, cache_ratio=0.0,
     use_cuda_graph=False, gpu_only=False,
-    min_draft_stride=1, max_draft_stride=16, draft_margin_threshold=-1.0,
-    max_sparse_stride=64, sparse_margin_threshold=-1.0
+    min_draft_stride=1, max_draft_stride=16, draft_margin_threshold=-1.0, draft_hit_attn_threshold=-1.0,
+    max_sparse_stride=64, sparse_margin_threshold=-1.0, sparse_retrieval_attn_threshold=-1.0,
+    expanded_margin_threshold=-1.0, expanded_attn_threshold=-1.0
 ):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     MODEL_NAME = model_name.split("/")[-1]+'.json'
@@ -91,8 +96,12 @@ def generate_config(
         _config[attn_type]['min_draft_stride'] = min_draft_stride
         _config[attn_type]['max_draft_stride'] = max_draft_stride
         _config[attn_type]['draft_margin_threshold'] = draft_margin_threshold
+        _config[attn_type]['draft_hit_attn_threshold'] = draft_hit_attn_threshold
         _config[attn_type]['max_sparse_stride'] = max_sparse_stride
         _config[attn_type]['sparse_margin_threshold'] = sparse_margin_threshold
+        _config[attn_type]['sparse_retrieval_attn_threshold'] = sparse_retrieval_attn_threshold
+        _config[attn_type]['expanded_margin_threshold'] = expanded_margin_threshold
+        _config[attn_type]['expanded_attn_threshold'] = expanded_attn_threshold
     
     if attn_type != "Full_Flash_Attn":
         print(_config[attn_type])
