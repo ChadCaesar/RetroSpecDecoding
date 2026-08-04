@@ -159,7 +159,7 @@ class retroinfer_cache_gpu(KV_Cache):
         thread_pool_pointer = self.thread_pool.get()
         # initialize the CPU Wave Buffer, only used to build index when prefilling
         self.wave_buffer = [WaveBufferCPU(
-            self.batch_size, self.kv_head, self.head_dim, self.nprobe, self.nprobe_new, self.page_size, 
+            self.batch_size, self.kv_head, self.head_dim, self.nprobe, self.nprobe + self.nprobe_new, self.page_size,
             self.n_centroids, 1, 1, core, thread_pool_pointer)
             for _ in range(self.layer_num)
         ]

@@ -162,7 +162,7 @@ class retroinfer_cache(KV_Cache):
         thread_pool_pointer = self.thread_pool.get()
         # initialize the Wave Buffer
         self.wave_buffer = [WaveBufferCPU(
-            self.batch_size, self.kv_head, self.head_dim, self.nprobe, self.nprobe_new, self.page_size, 
+            self.batch_size, self.kv_head, self.head_dim, self.nprobe, self.nprobe + self.nprobe_new, self.page_size,
             self.n_centroids+self.n_centroids_new, self.buffer_size, self.cache_size, core, thread_pool_pointer)
             for _ in range(self.layer_num)
         ]

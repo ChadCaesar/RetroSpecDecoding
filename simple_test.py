@@ -5,13 +5,14 @@ import math
 import torch
 import argparse
 import random
+import hashlib
 import numpy as np
 from termcolor import colored
 
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(PROJECT_ROOT)
 from model_hub import load_model, load_tokenizer, add_model_args
-from config import generate_config, add_config_args, add_spec_args
+from config import generate_config, add_config_args, add_spec_args, add_cluster_index_args
 
 
 def set_seed(seed):
@@ -24,9 +25,9 @@ def set_seed(seed):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Test example")
-    parser.add_argument("--batch_size", type=int, default=1, help="Total Batch size")
+    parser.add_argument("--data_index", type=int, default=0, help="Index of prompt and groundtruth in data")
     parser.add_argument("--prefill_bsz", type=int, default=1, help="Prefilling batch size")
-    parser.add_argument("--gen_len", type=int, default=100, help="Generation length")
+    parser.add_argument("--gen_len", type=int, default=500, help="Generation length")
     parser.add_argument("--do_sample", action='store_true', help="Whether to use sampling when decoding")
     parser.add_argument("--prefill_method", type=str, default="full", choices=["full", "xattn", "minfer"], 
                         help="Prefilling method")
@@ -34,6 +35,7 @@ def parse_args():
     parser = add_model_args(parser)
     parser = add_config_args(parser)
     parser = add_spec_args(parser)
+    parser = add_cluster_index_args(parser)
     args = parser.parse_args()
     
     return args
@@ -45,7 +47,7 @@ if __name__ == "__main__":
     print(args)
 
     model_name = args.model_name
-    batch_size = args.batch_size
+    data_index = args.data_index
     attn_type = args.attn_type
     dtype = torch.float16 if args.dtype=='fp16' else torch.bfloat16
     device = args.device
@@ -55,23 +57,12 @@ if __name__ == "__main__":
     print(colored(f"Loading test data from {TEST_FILE}", 'yellow'))
     data = json.load(open(TEST_FILE))   # [{"input": str, "outputs": str}, ...]
     if type(data) is dict: data = [data]
-    prompt, groundtruth = [], []
-    for dd in data:
-        prompt.append(dd['input'])
-        groundtruth.append(dd['outputs'])
     
-    # copy to fit batch size
-    copy_round = math.ceil(batch_size/len(prompt))
-    prompts, groundtruths = [], []
-    for i in range(copy_round):
-        prompts.extend(prompt)
-        groundtruths.extend(groundtruth)
-    prompts = prompts[:batch_size]
-    groundtruths = groundtruths[:batch_size]
-
+    prompt = data[data_index]['input']
+    groundtruth = data[data_index]['outputs']
     # tokenize input data
     tokenizer = load_tokenizer(model_name)
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True)
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True)
     input_ids = inputs.input_ids
     attention_masks = inputs.attention_mask
 
@@ -80,11 +71,16 @@ if __name__ == "__main__":
     max_len = input_len + gen_len
     print(colored(f"Input length: {input_len}, Gen length: {gen_len}", 'yellow'))
 
+    fingerprint_data = {"model_name": model_name, "dtype": str(dtype), "prefill_method": args.prefill_method, "input_ids": input_ids.tolist()}
+    fingerprint = hashlib.sha256(json.dumps(fingerprint_data, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
     attn_config = generate_config(model_name, input_len, attn_type, 
-                                  float(args.retrieval_budget), float(args.estimation_budget), float(args.cache_ratio),
-                                  args.use_cuda_graph, args.gpu_only,
-                                  args.min_draft_stride, args.max_draft_stride, args.draft_margin_threshold, args.draft_margin_drop_threshold,
-                                  args.max_sparse_stride, args.sparse_stability_threshold)
+                                float(args.retrieval_budget), float(args.estimation_budget), float(args.cache_ratio),
+                                args.use_cuda_graph, args.gpu_only,
+                                args.min_draft_stride, args.max_draft_stride, args.draft_margin_threshold, args.draft_hit_attn_threshold,
+                                args.max_sparse_stride, args.sparse_margin_threshold, args.sparse_retrieval_attn_threshold,
+                                args.expanded_margin_threshold, args.expanded_attn_threshold,
+                                args.cluster_index_mode, args.cluster_index_path, fingerprint)
     llm = load_model(model_name, max_len, dtype, device, tokenizer)
 
     out = llm.generate(
@@ -103,6 +99,9 @@ if __name__ == "__main__":
     )
     
     result = tokenizer.batch_decode(out, skip_special_tokens=True)
-    for gt, res in zip(groundtruths, result):
-        print(colored(f"Answer: {gt}", 'yellow'))
-        print(f"{[res]}")
+    # print(colored(f"Answer: {groundtruth}", 'yellow'))
+    # print(f"{[result]}")
+
+    output_tensor = torch.tensor(out, dtype=torch.int64)
+    output_hash = hashlib.sha256(output_tensor.numpy().tobytes()).hexdigest()
+    print(f"Output hash: {output_hash}")

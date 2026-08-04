@@ -106,6 +106,8 @@ public:
             const int64_t& key = _hit_keys[i];
             auto& cluster_descriptor = cluster_descriptors[key];
 
+            if (cluster_descriptor.BlockNum == 0) continue;
+
             // update LRU order
             lru_keys.erase(cluster_descriptor.LRUEntryPointer);
             lru_keys.push_front(key);
@@ -206,7 +208,8 @@ public:
         for (int i = 0; i < num; ++i) {
             const int64_t& key = keys[i];
             auto& cluster_descriptor = cluster_descriptors[key];
-            
+
+            if (cluster_descriptor.BlockNum == 0) continue;
             consider_block_num += cluster_descriptor.BlockNum;
             // ignore clusters that can not fit in the buffer
             if (consider_block_num > max_consider_block) {
@@ -268,6 +271,7 @@ public:
         for (int i = 0; i < num; ++i) {
             const int64_t& key = keys[i];
             auto& cd = cluster_descriptors[key];
+            if (cd.BlockNum == 0) continue;
             consider_block_num += cd.BlockNum;
             if (consider_block_num > max_consider_block) break;
 
@@ -302,6 +306,7 @@ private:
     const int dim;          // dimension of the vector
 
     int nprobe;             // searched cluster number
+    const int max_search_nprobe;
     const int block_size;   // full vector number for one block
     const int final_n_centroids;  // final number of clusters for each group (since index may insert new data during decoding)
 
@@ -364,9 +369,9 @@ public:
     int64_t output_seq_length;
 
 
-    WaveBufferCPU(int batch_size, int group_num, int dim, int nprobe, int new_nprobe, int block_size, 
+    WaveBufferCPU(int batch_size, int group_num, int dim, int nprobe, int max_search_nprobe, int block_size,
         int final_n_centroids, int buffer_size, int capacity, int threads, MyThreadPool* pool)
-     : batch_size(batch_size), group_num(group_num), dim(dim), nprobe(nprobe), block_size(block_size),
+     : batch_size(batch_size), group_num(group_num), dim(dim), nprobe(nprobe), max_search_nprobe(max_search_nprobe), block_size(block_size),
      final_n_centroids(final_n_centroids), buffer_size(buffer_size), capacity(capacity), pool_(pool) {
         batch_groups = batch_size * group_num;
         // count valid threads and groups per thread
@@ -420,7 +425,7 @@ public:
         caches.resize(batch_groups, nullptr);
         if (final_n_centroids > 0) {
             for (int i = 0; i < batch_groups; ++i) {
-                caches[i] = new BufferManager(capacity, nprobe+new_nprobe, block_size, buffer_size,
+                caches[i] = new BufferManager(capacity, max_search_nprobe, block_size, buffer_size,
                                               cluster_descriptors + i * final_n_centroids);
             }
         }
@@ -526,8 +531,20 @@ public:
         // AT_ASSERT(update_block_sizes_tensor.size(-1) == buffer_size, "Wrong update block sizes size.");
         // AT_ASSERT(update_cache_indices_tensor.size(-1) == capacity, "Wrong update cache indices size.");
 
-        searched_clusters_ptr = static_cast<int64_t*>(searched_clusters.data_ptr<int64_t>());
+        set_searched_clusters(searched_clusters);
         // AT_ASSERT(searched_clusters.size(-1) == nprobe, "Wrong searched clusters size.");
+    }
+
+    void set_searched_clusters(torch::Tensor& searched_clusters) {
+        TORCH_CHECK(searched_clusters.device().is_cpu(), "searched_clusters must be a CPU tensor");
+        TORCH_CHECK(searched_clusters.scalar_type() == torch::kInt64, "searched_clusters must use int64");
+        TORCH_CHECK(searched_clusters.is_contiguous(), "searched_clusters must be contiguous");
+        TORCH_CHECK(searched_clusters.dim() == 2, "searched_clusters must be a 2D tensor");
+        TORCH_CHECK(searched_clusters.size(0) == batch_groups, "searched_clusters batch_groups mismatch");
+        TORCH_CHECK(searched_clusters.size(1) <= max_search_nprobe, "searched cluster count exceeds max_search_nprobe");
+
+        searched_clusters_ptr = static_cast<int64_t*>(searched_clusters.data_ptr<int64_t>());
+        nprobe = static_cast<int>(searched_clusters.size(1));
     }
 
     void set_kv(
@@ -746,8 +763,7 @@ public:
         last_n_centroids += n_centroids;    // update current number of clusters
 
         // update the searched clusters
-        searched_clusters_ptr = static_cast<int64_t*>(searched_clusters.data_ptr<int64_t>());
-        nprobe = searched_clusters.size(1);
+        set_searched_clusters(searched_clusters);
     }
 
 
@@ -885,7 +901,7 @@ namespace py = pybind11;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<WaveBufferCPU>(m, "WaveBufferCPU")
         .def(py::init<int, int, int, int, int, int, int, int, int, int, MyThreadPool*>(),
-             py::arg("batch_size"), py::arg("group_num"), py::arg("dim"), py::arg("nprobe"), py::arg("new_nprobe"),
+             py::arg("batch_size"), py::arg("group_num"), py::arg("dim"), py::arg("nprobe"), py::arg("max_search_nprobe"),
              py::arg("block_size"), py::arg("final_n_centroids"), py::arg("buffer_size"), py::arg("capacity"), 
              py::arg("threads"), py::arg("pool"))
         .def("set_indices", &WaveBufferCPU::set_indices, 
@@ -893,6 +909,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("miss_block_ids"), py::arg("miss_block_sizes"), py::arg("miss_block_sizes_cumsum"), py::arg("miss_block_nums"),
             py::arg("estimate_mask"),
             py::arg("update_buffer_indices"), py::arg("update_block_sizes"), py::arg("update_cache_indices"), py::arg("update_block_nums"), 
+            py::arg("searched_clusters"))
+        .def("set_searched_clusters", &WaveBufferCPU::set_searched_clusters,
             py::arg("searched_clusters"))
         .def("set_kv", &WaveBufferCPU::set_kv, 
             py::arg("ivf_key"), py::arg("ivf_value"), py::arg("input_keys"), py::arg("input_values"))

@@ -1,3 +1,4 @@
+import os
 import math
 import torch
 from retroinfer_kernels import ThreadPool, WaveBufferCPU
@@ -37,6 +38,9 @@ class specdecoder_cache(KV_Cache):
         buffer_cluster_num: int,    # number of clusters in the buffer
         use_cuda_graph: bool,
         spec_stride: int,
+        cluster_index_mode: str,
+        cluster_index_path: str,
+        fingerprint: str,
         prefill_bsz: int,
         num_gpus: int,
         model_size: int
@@ -126,8 +130,11 @@ class specdecoder_cache(KV_Cache):
         # estimation zone size (count by clusters)
         self.es_cluster_num = min(round(self.n_centroids*estimation_budget), self.n_centroids-self.nprobe)
         self.max_nprobe = self.nprobe + self.nprobe_new
+        self.max_search_nprobe = min(2 * (self.nprobe + self.nprobe_new), self.n_centroids + self.n_centroids_new)
         # retrieve zone + estimation zone size
         self.max_compute_cluster_num = self.es_cluster_num + self.nprobe
+        self._refresh_expanded_search_size()
+        self.expanded_verify_mode = False
         assert self.max_compute_cluster_num <= self.n_centroids, \
             f"max_compute_cluster_num({self.max_compute_cluster_num}) should <= n_centroids({self.n_centroids})"
         print(f"Initial n_centroids: {self.n_centroids}, nprobe: {self.nprobe}, es_cluster_num: {self.es_cluster_num}")
@@ -144,6 +151,23 @@ class specdecoder_cache(KV_Cache):
              for ldx in range(self.layer_num)]
             for _ in range(self.spec_stride)
         ]
+        self.hit_attention_ratios = []
+        self.retrieval_attention_ratios = []
+        self.expanded_attention_ratios = []
+
+        # cluster index config
+        self.cluster_index_mode = cluster_index_mode
+        self.cluster_index_path = cluster_index_path
+        self.fingerprint = fingerprint
+        self.cluster_indices = None
+
+        if self.cluster_index_mode == "save":
+            self.cluster_indices = [None] * self.layer_num
+        elif self.cluster_index_mode == "load":
+            checkpoint = torch.load(self.cluster_index_path, map_location="cpu", weights_only=True)
+            if checkpoint.get("fingerprint") != self.fingerprint:
+                raise ValueError("Cluster index fingerprint mismatch")
+            self.cluster_indices = checkpoint["data"]
 
         # calculate the GPU block cache size and compute buffer size (count by pages)
         cache_cluster_num = round((self.n_centroids + self.n_centroids_new) * cache_ratio) if cache_ratio > 0.0 \
@@ -160,7 +184,7 @@ class specdecoder_cache(KV_Cache):
         thread_pool_pointer = self.thread_pool.get()
         # initialize the Wave Buffer
         self.wave_buffer = [WaveBufferCPU(
-            self.batch_size, self.kv_head, self.head_dim, self.nprobe, self.nprobe_new, self.page_size, 
+            self.batch_size, self.kv_head, self.head_dim, self.nprobe, self.max_search_nprobe, self.page_size,
             self.n_centroids+self.n_centroids_new, self.buffer_size, self.cache_size, core, thread_pool_pointer)
             for _ in range(self.layer_num)
         ]
@@ -223,6 +247,7 @@ class specdecoder_cache(KV_Cache):
         ]
         # store searched TopK cluster IDs
         self.cluster_ids = torch.empty((self.batch_groups, self.nprobe), dtype=torch.int64, pin_memory=True).contiguous()
+        self.expanded_cluster_ids = torch.empty((self.batch_groups, self.expanded_nprobe), dtype=torch.int64, pin_memory=True).contiguous()
 
         for ldx in range(self.layer_num):
             self.wave_buffer[ldx].set_indices(
@@ -338,7 +363,22 @@ class specdecoder_cache(KV_Cache):
         
         # set decoding attention function
         self.attn_func = self.dense_attention
-    
+
+
+    def _refresh_expanded_search_size(self):
+        if self.nprobe == 0:
+            self.expanded_nprobe = 0
+            self.expanded_es_cluster_num = 0
+            return
+
+        requested_nprobe = 2 * self.nprobe
+
+        if requested_nprobe > self.max_compute_cluster_num:
+            raise ValueError(f"Cannot double sparse exact zone: 2 * nprobe ({requested_nprobe}) exceeds max_compute_cluster_num ({self.max_compute_cluster_num})")
+
+        self.expanded_nprobe = requested_nprobe
+        self.expanded_es_cluster_num = self.max_compute_cluster_num - self.expanded_nprobe
+
 
     def pre_allocate_decision(self):
         """Decide whether to pre-allocate GPU cache and buffers before prefilling"""
@@ -458,12 +498,27 @@ class specdecoder_cache(KV_Cache):
         self.valid_lengths = self.valid_lengths_dict[self.layer_mapping[str(0)]]
 
 
+    def save_cluster_index(self):
+        if self.cluster_index_mode != "save":
+            return
+
+        parent = os.path.dirname(self.cluster_index_path)
+        if parent: os.makedirs(parent, exist_ok=True)
+
+        checkpoint = {
+            "fingerprint": self.fingerprint,
+            "data": self.cluster_indices
+        }
+        torch.save(checkpoint, self.cluster_index_path)
+
+
     def prepare_cache(self):
         """Ensure GPU cache and buffers are allocated before decoding"""
         if self.build_index_when_prefilling:
             # sync the last batch of the last layer
             torch.cuda.synchronize()
             self.wave_buffer[self.layer_num-1].construction_sync()
+            if self.cluster_index_mode == "save": self.save_cluster_index()
             # clear temp memory
             self.clusters_cpu, self.cluster_size_cpu = None, None
             self.temp_keys, self.temp_values = None, None
@@ -543,27 +598,46 @@ class specdecoder_cache(KV_Cache):
             self.steady_zone_values[layer_idx][start_bdx:end_bdx, :, self.static_pattern_start:self.static_pattern_total, :] = \
                 value_states[:, seq_len-self.static_pattern_end:seq_len, :, :].transpose(1, 2)
 
-            # compute key mean, shape (bsz*group_num, 1, head_dim)
-            mean_key = torch.mean(self.temp_keys, dim=1, keepdim=True)
+            if self.cluster_index_mode == "load":
+                cluster_index_data = self.cluster_indices[layer_idx]
 
-            # segmented clustering
-            _centroids, _value_sum, _clusters, _cluster_size = segment_k_means(
-                key=self.temp_keys-mean_key,    # centering to 0
-                value=self.temp_values,
-                num_centroids=self.n_centroids,
-                num_segments=self.n_segment,
-            )
-            # assert _centroids.shape[-2] == _value_sum.shape[-2] == _cluster_size.shape[-1] == _clusters.shape[-2] == self.n_centroids
+                final_centroids = cluster_index_data["centroids"].contiguous()
+                value_sum = cluster_index_data["value_sum"].contiguous()
+                cluster_size_cpu = cluster_index_data["cluster_size"].to(torch.int32).contiguous()
+                clusters_cpu = cluster_index_data["clusters"].to(torch.int32).contiguous()
+            else:
+                # compute key mean, shape (bsz*group_num, 1, head_dim)
+                mean_key = torch.mean(self.temp_keys, dim=1, keepdim=True)
+
+                # segmented clustering
+                centroids, value_sum, clusters, cluster_size = segment_k_means(
+                    key=self.temp_keys-mean_key,    # centering to 0
+                    value=self.temp_values,
+                    num_centroids=self.n_centroids,
+                    num_segments=self.n_segment,
+                )
+
+                final_centroids = centroids + mean_key
+                cluster_size_cpu = cluster_size.detach().cpu().contiguous()
+                clusters_cpu = clusters.detach().cpu().contiguous()
+
+                if self.cluster_index_mode == "save":
+                    self.cluster_indices[layer_idx] = {
+                        "centroids": final_centroids.detach().cpu().contiguous().clone(),
+                        "value_sum": value_sum.detach().cpu().contiguous().clone(),
+                        "cluster_size": cluster_size_cpu.clone(),
+                        "clusters": clusters_cpu.clone()
+                    }
 
             # copy meta index
-            self.centroids[layer_idx][start_bdx*self.kv_head:end_bdx*self.kv_head, :, :].copy_(_centroids + mean_key)         # (bsz*group_num, n_centroids, dim)
-            self.value_sum[layer_idx][start_bdx*self.kv_head:end_bdx*self.kv_head, :, :].copy_(_value_sum)                    # (bsz*group_num, n_centroids, dim)
-            self.centroids_mask[layer_idx][start_bdx*self.kv_head:end_bdx*self.kv_head, :].copy_(_cluster_size == 0)          # (bsz*group_num, n_centroids)
-            self.cluster_size[layer_idx][start_bdx*self.kv_head:end_bdx*self.kv_head, :].copy_(_cluster_size.to(self.dtype))  # (bsz*group_num, n_centroids)
+            self.centroids[layer_idx][start_bdx*self.kv_head:end_bdx*self.kv_head, :, :].copy_(final_centroids.to(dtype=self.dtype, device=self.layer_mapping[str(layer_idx)]))         # (bsz*group_num, n_centroids, dim)
+            self.value_sum[layer_idx][start_bdx*self.kv_head:end_bdx*self.kv_head, :, :].copy_(value_sum.to(dtype=self.dtype, device=self.layer_mapping[str(layer_idx)]))                    # (bsz*group_num, n_centroids, dim)
+            self.centroids_mask[layer_idx][start_bdx*self.kv_head:end_bdx*self.kv_head, :].copy_(cluster_size_cpu.to(device=self.layer_mapping[str(layer_idx)]) == 0)          # (bsz*group_num, n_centroids)
+            self.cluster_size[layer_idx][start_bdx*self.kv_head:end_bdx*self.kv_head, :].copy_(cluster_size_cpu.to(dtype=self.dtype, device=self.layer_mapping[str(layer_idx)]))  # (bsz*group_num, n_centroids)
 
             # cluster results will be used to organize the offload KV cache
-            self.cluster_size_cpu = _cluster_size.cpu().contiguous()    # (bsz*group_num, n_centroids)
-            self.clusters_cpu = _clusters.cpu().contiguous()            # (bsz*group_num, n_centroids, max_cluster_size)
+            self.cluster_size_cpu = cluster_size_cpu    # (bsz*group_num, n_centroids)
+            self.clusters_cpu = clusters_cpu            # (bsz*group_num, n_centroids, max_cluster_size)
         else:   # do not build index during prefilling
             assert valid_start == 0, f"Requests in the same batch should have the same length."
             end_bdx = start_bdx + bsz
@@ -658,6 +732,8 @@ class specdecoder_cache(KV_Cache):
         self.n_centroids += self.UPDATE_CENTROIDS
         self.es_cluster_num += self.UPDATE_ES
         self.max_compute_cluster_num += (self.UPDATE_NPROBE + self.UPDATE_ES)
+        self._refresh_expanded_search_size()
+        self.expanded_cluster_ids = torch.empty((self.batch_groups, self.expanded_nprobe), dtype=torch.int64, pin_memory=True).contiguous()
 
         self.draft_topk_indices = [
             [torch.zeros((self.batch_groups, self.max_compute_cluster_num), dtype=torch.int64,
@@ -764,6 +840,9 @@ class specdecoder_cache(KV_Cache):
         self.spec_draft_mode = True
         self.attn_func = self.draft_attention
         self.draft_step = 0
+        self.hit_attention_ratios.clear()
+        self.retrieval_attention_ratios.clear()
+        self.expanded_attention_ratios.clear()
 
 
     def end_draft(self):
@@ -779,6 +858,7 @@ class specdecoder_cache(KV_Cache):
 
     def verify_block(self):
         self.spec_draft_mode = False
+        self.expanded_verify_mode = False
         self.attn_func = self.verify_attention
         self.verify_step = 0
 
@@ -787,6 +867,22 @@ class specdecoder_cache(KV_Cache):
         self.context = self._verify_saved_context
         self.static_pattern_total = self._verify_saved_static_pattern_total
         self.verify_block()
+
+
+    def checkpoint_verify_token(self):
+        return (
+            self.context,
+            self.static_pattern_total,
+            self.verify_step,
+        )
+
+
+    def restore_verify_token(self, checkpoint):
+        (
+            self.context,
+            self.static_pattern_total,
+            self.verify_step,
+        ) = checkpoint
 
 
     def draft_attention(self, queries, layer_idx, static_len):
@@ -807,6 +903,7 @@ class specdecoder_cache(KV_Cache):
         torch.topk(self.dist, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True, out=(self.cV, self.cI))
         self.draft_topk_indices[self.draft_step][layer_idx].copy_(self.cI)
         self.cluster_ids.copy_(self.cI[..., :self.nprobe])
+        self.wave_buffer[layer_idx].set_searched_clusters(self.cluster_ids)
 
         if layer_idx == self.layer_num - 1:
             self.draft_step += 1
@@ -875,6 +972,17 @@ class specdecoder_cache(KV_Cache):
             cache_seqlens=self.valid_lengths,
             return_softmax_lse=False
         )
+
+        hit_attention_ratio = self.cV[:, :self.nprobe].float().masked_fill(estimate_mask, 0.0).sum(dim=-1) / self.group_size
+        retrieval_attention_ratio = self.cV[:, :self.nprobe].float().sum(dim=-1) / self.group_size
+        expanded_attention_ratio = self.cV[:, :self.expanded_nprobe].float().sum(dim=-1) / self.group_size
+        if layer_idx == 0:
+            self.hit_attention_ratios.clear()
+            self.retrieval_attention_ratios.clear()
+            self.expanded_attention_ratios.clear()
+        self.hit_attention_ratios.append(hit_attention_ratio.mean().detach().cpu())
+        self.retrieval_attention_ratios.append(retrieval_attention_ratio.mean().detach().cpu())
+        self.expanded_attention_ratios.append(expanded_attention_ratio.mean().detach().cpu())
         
         return attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim)
     
@@ -889,28 +997,38 @@ class specdecoder_cache(KV_Cache):
         """
         self.static_len_tensor.fill_(static_len)
 
+        if self.expanded_verify_mode:
+            active_nprobe = self.expanded_nprobe
+            active_cluster_ids = self.expanded_cluster_ids
+            active_es_cluster_num = self.expanded_es_cluster_num
+        else:
+            active_nprobe = self.nprobe
+            active_cluster_ids = self.cluster_ids
+            active_es_cluster_num = self.es_cluster_num
+
         # 复用 draft 阶段计算好的 topk 聚类 ID
         self.cI.copy_(self.draft_topk_indices[self.verify_step][layer_idx])
-        self.cluster_ids.copy_(self.cI[..., :self.nprobe])  # copy the topk cluster ids to the CPU pin memory
+        active_cluster_ids.copy_(self.cI[..., :active_nprobe])  # copy the topk cluster ids to the CPU pin memory
+        self.wave_buffer[layer_idx].set_searched_clusters(active_cluster_ids)
 
         if layer_idx == self.layer_num - 1:
             self.verify_step += 1
 
         # estimation zone attention computation
-        if self.es_cluster_num > 0:
+        if active_es_cluster_num  > 0:
             gather_copy_vectors(
                 self.centroids[layer_idx], self.es_centroids, 
                 self.value_sum[layer_idx], self.es_value_sum, 
                 self.cluster_size[layer_idx], self.es_cluster_size,
                 self.cI, self.batch_groups, self.n_centroids, self.es_cluster_num, 
-                self.max_compute_cluster_num, self.nprobe, self.es_cluster_num
+                self.max_compute_cluster_num, active_nprobe, active_es_cluster_num
             )
             
             es_out, es_lse = weighted_flash_decoding(
                                 queries.view(self.batch_groups, 1, self.group_size, self.head_dim), 
-                                self.es_centroids,       # [batch_size*group_num, es_cluster_num, 1, dim]
-                                self.es_value_sum,       # [batch_size*group_num, es_cluster_num, 1, dim]
-                                self.es_cluster_size,    # [batch_size*group_num, 1, 1, es_cluster_num]
+                                self.es_centroids[:, :active_es_cluster_num].contiguous(),
+                                self.es_value_sum[:, :active_es_cluster_num].contiguous(),
+                                self.es_cluster_size[..., :active_es_cluster_num].contiguous(),
                                 previous_out=None, previous_lse=None,
                                 return_softmax_lse=True
                             )
