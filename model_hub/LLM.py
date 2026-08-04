@@ -216,7 +216,7 @@ class LLM:
                 draft_token = self.sampling(draft_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
 
                 draft_tokens.append(draft_token)
-                print(colored(f"{draft_token.item()}", 'blue'), end="")
+                # print(colored(f"{draft_token.item()}", 'blue'), end="")
 
                 draft_logits_fp32 = draft_logits.detach().float().squeeze(1)
                 draft_top2 = torch.topk(draft_logits_fp32, k=2, dim=-1)
@@ -229,7 +229,7 @@ class LLM:
                     "expanded_attn": torch.stack(self.kv_cache.expanded_attention_ratios).float().mean().item()
                 }
                 draft_metrics.append(draft_metric)
-                print(colored(f"({round(draft_metric['draft_margin'], 4)}, {round(draft_metric['hit_attn'], 4)})", "cyan"), end=" ")
+                # print(colored(f"({round(draft_metric['draft_margin'], 4)}, {round(draft_metric['hit_attn'], 4)})", "cyan"), end=" ")
 
                 should_stop, draft_stop_reason = self.should_stop_draft(len(draft_tokens), draft_metric['draft_margin'], draft_metric['hit_attn'])
                 if should_stop:
@@ -238,7 +238,7 @@ class LLM:
         finally:
             self.kv_cache.end_draft()
 
-        print()
+        # print()
         return draft_tokens, draft_metrics, draft_reason
 
 
@@ -310,8 +310,8 @@ class LLM:
 
             sparse_retrieval_attn = draft_metrics[i]['retrieval_attn']
 
-            print(colored(f"{sparse_token.item()}", 'yellow'), end="")
-            print(colored(f"({round(sparse_margin, 4)}, {round(sparse_retrieval_attn, 4)})", 'red' if sparse_changed else 'green'), end=" ")
+            # print(colored(f"{sparse_token.item()}", 'yellow'), end="")
+            # print(colored(f"({round(sparse_margin, 4)}, {round(sparse_retrieval_attn, 4)})", 'red' if sparse_changed else 'green'), end=" ")
 
             if sparse_changed: sparse_reason.append("change")
             if self.sparse_margin_threshold >= 0.0 and sparse_margin < self.sparse_margin_threshold: sparse_reason.append("margin")
@@ -348,7 +348,7 @@ class LLM:
                     })
 
                     sparse_token = expanded_token
-                    print(colored(f"{sparse_token.item()}({round(expanded_margin, 4)}, {round(expanded_attn, 4)})", 'red' if expanded_reason else 'green'), end=" ")
+                    # print(colored(f"{sparse_token.item()}({round(expanded_margin, 4)}, {round(expanded_attn, 4)})", 'red' if expanded_reason else 'green'), end=" ")
                 finally:
                     self.kv_cache.expanded_verify_mode = False
 
@@ -363,7 +363,7 @@ class LLM:
             if sparse_changed or expanded_reason:
                 break
 
-        print()
+        # print()
         return sparse_tokens, accepted_metrics, rejected_metrics, sparse_reason, expanded_reason, expanded_accept_num
 
 
@@ -384,12 +384,12 @@ class LLM:
             else:
                 reject_count += 1
 
-            print(colored(f"{full_token.item()}", 'green' if accept else 'red'), end=" ")
+            # print(colored(f"{full_token.item()}", 'green' if accept else 'red'), end=" ")
 
             if not accept:
                 break
 
-        print()
+        # print()
         return full_tokens, accept_count, reject_count
 
 
@@ -455,7 +455,7 @@ class LLM:
 
             while generated_len < self.max_new_length-1:
                 # Draft 阶段
-                print(colored("Draft:", 'blue'), end=" ")
+                # print(colored("Draft:", 'blue'), end=" ")
                 actual_stride = min(
                     self.kv_cache.spec_stride,
                     self.max_new_length-generated_len-len(pending_sparse_tokens)-1,
@@ -470,7 +470,7 @@ class LLM:
                 self.first_draft_step = False
 
                 # Sparse Verify 阶段
-                print(colored(f"Sparse by {draft_reason}:", 'yellow'), end=" ")
+                # print(colored(f"Sparse by {draft_reason}:", 'yellow'), end=" ")
                 if len(pending_sparse_tokens) == 0:
                     self.kv_cache.begin_verify()
                 else:
@@ -487,13 +487,13 @@ class LLM:
 
                 full_trigger, full_trigger_reasons = self.should_trigger_full_verify(generated_len, len(pending_sparse_tokens), expanded_reason)
                 if not full_trigger:
-                    print(colored("Full deferred", 'green'))
+                    # print(colored("Full deferred", 'green'))
                     continue
 
                 self.kv_cache.end_verify()
 
                 # Full Verify 阶段
-                print(colored(f"Full by {full_trigger_reasons}:", 'red' if expanded_reason else 'green'), end=" ")
+                # print(colored(f"Full by {full_trigger_reasons}:", 'red' if expanded_reason else 'green'), end=" ")
                 for reason in full_trigger_reasons.split("+"):
                     full_trigger_reason_counts[reason] = full_trigger_reason_counts.get(reason, 0) + 1
                 full_tokens, current_full_accept_num, current_full_reject_num = self.full_verify(output_ids, pending_sparse_tokens, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
@@ -515,7 +515,7 @@ class LLM:
                 if not ignore_eos and end_of_text.all():
                     break
                 output_ids = full_tokens[-1]
-                print()
+                # print()
             print(
                 colored(
                     f"Draft tokens: {draft_num}, "
@@ -531,9 +531,9 @@ class LLM:
                     "green"
                 )
             )
-            print("Full verify trigger counts: " f"{full_trigger_reason_counts}")
-            self.print_metric_summary("Draft vs Sparse - Accepted group", sparse_accepted_metrics_list)
-            self.print_metric_summary("Draft vs Sparse - Rejected group", sparse_rejected_metrics_list)
+            # print("Full verify trigger counts: " f"{full_trigger_reason_counts}")
+            # self.print_metric_summary("Draft vs Sparse - Accepted group", sparse_accepted_metrics_list)
+            # self.print_metric_summary("Draft vs Sparse - Rejected group", sparse_rejected_metrics_list)
 
         torch.cuda.synchronize()
         decode_end = time.time()

@@ -405,6 +405,7 @@ benchmark/ruler/ruler_eval_result/
 benchmark/reasoning/outputs
 temp/
 docs/
+cluster_indices/
 
 !benchmark/reasoning/data/**/*.jsonl
 !asserts/*.png

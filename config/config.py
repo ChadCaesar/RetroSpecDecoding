@@ -17,13 +17,19 @@ def add_config_args(parser):
 def add_spec_args(parser):
     parser.add_argument("--min_draft_stride", type=int, default=1, help="Min number of draft tokens per speculative step")
     parser.add_argument("--max_draft_stride", type=int, default=16, help="Max number of draft tokens per speculative step")
-    parser.add_argument("--draft_margin_threshold", type=float, default=0.2, help="Stop draft when margin is below this value")
-    parser.add_argument("--draft_hit_attn_threshold", type=float, default=0.2, help="Stop draft when hit attention ratio is below this value")
+    parser.add_argument("--draft_margin_threshold", type=float, default=-1.0, help="Stop draft when margin is below this value")
+    parser.add_argument("--draft_hit_attn_threshold", type=float, default=-1.0, help="Stop draft when hit attention ratio is below this value")
     parser.add_argument("--max_sparse_stride", type=int, default=64, help="Max number of sparse-verify tokens pending full-verify")
-    parser.add_argument("--sparse_margin_threshold", type=float, default=0.2, help="Trigger expanded verify when sparse margin is below this value")
-    parser.add_argument("--sparse_retrieval_attn_threshold", type=float, default=0.4, help="Trigger expanded verify when retrieval attention ratio is below this value")
-    parser.add_argument("--expanded_margin_threshold", type=float, default=0.2, help="Trigger full verify when expanded margin is below this value")
-    parser.add_argument("--expanded_attn_threshold", type=float, default=0.5, help="Trigger full verify when expanded attention ratio is below this value")
+    parser.add_argument("--sparse_margin_threshold", type=float, default=-1.0, help="Trigger expanded verify when sparse margin is below this value")
+    parser.add_argument("--sparse_retrieval_attn_threshold", type=float, default=-1.0, help="Trigger expanded verify when retrieval attention ratio is below this value")
+    parser.add_argument("--expanded_margin_threshold", type=float, default=-1.0, help="Trigger full verify when expanded margin is below this value")
+    parser.add_argument("--expanded_attn_threshold", type=float, default=-1.0, help="Trigger full verify when expanded attention ratio is below this value")
+    return parser
+
+
+def add_cluster_index_args(parser):
+    parser.add_argument("--cluster_index_mode", type=str, default="off", choices=["off", "save", "load"], help="Whether to save or load cluster index for SpecDecoder")
+    parser.add_argument("--cluster_index_path", type=str, default="cluster_indices/spec_data_0.pt", help="Path to save or load cluster index for SpecDecoder")
     return parser
 
 
@@ -51,7 +57,8 @@ def generate_config(
     use_cuda_graph=False, gpu_only=False,
     min_draft_stride=1, max_draft_stride=16, draft_margin_threshold=-1.0, draft_hit_attn_threshold=-1.0,
     max_sparse_stride=64, sparse_margin_threshold=-1.0, sparse_retrieval_attn_threshold=-1.0,
-    expanded_margin_threshold=-1.0, expanded_attn_threshold=-1.0
+    expanded_margin_threshold=-1.0, expanded_attn_threshold=-1.0,
+    cluster_index_mode="off", cluster_index_path="cluster_indices/simple_test.pt", fingerprint=None
 ):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     MODEL_NAME = model_name.split("/")[-1]+'.json'
@@ -102,6 +109,9 @@ def generate_config(
         _config[attn_type]['sparse_retrieval_attn_threshold'] = sparse_retrieval_attn_threshold
         _config[attn_type]['expanded_margin_threshold'] = expanded_margin_threshold
         _config[attn_type]['expanded_attn_threshold'] = expanded_attn_threshold
+        _config[attn_type]['cluster_index_mode'] = cluster_index_mode
+        _config[attn_type]['cluster_index_path'] = os.path.abspath(cluster_index_path)
+        _config[attn_type]['fingerprint'] = fingerprint
     
     if attn_type != "Full_Flash_Attn":
         print(_config[attn_type])
